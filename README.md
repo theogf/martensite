@@ -2,17 +2,20 @@
 
 A [Steel](https://github.com/mattwparas/steel) plugin for [Helix](https://helix-editor.com) that sends the current selection to a running [DaemonicCabal.jl](https://github.com/tecosaur/DaemonicCabal.jl) session.
 
+> [!WARNING]
+> Getting this setup requires advanced knowledge in git and linux setup 
+
 ## Prerequisites
 
 ### 1. Helix — steel branch
 
 Follow the instructions [here](https://github.com/mattwparas/helix/blob/steel-event-system/STEEL.md) to install the correct version of Helix with the plugin system.
 
-Point `HELIX_RUNTIME` at the runtime directory if Helix can't find its queries:
-
-```sh
-export HELIX_RUNTIME=/path/to/helix/runtime
-```
+> [!NOTE]
+> Point `HELIX_RUNTIME` at the runtime directory if Helix can't find its queries:
+> ```sh
+> export HELIX_RUNTIME=/path/to/helix/runtime
+> ```
 
 ### 2. DaemonicCabal.jl
 
