@@ -48,6 +48,11 @@ fn main() {
 
     let mut conductor = Conductor::new(config);
 
+    // Clean up leftover files from previous run before creating the server socket
+    if conductor.config.transport == protocol::TransportMode::Unix {
+        conductor.cleanup_runtime_dir();
+    }
+
     // Create server
     let server = match conductor.create_server() {
         Ok(s) => s,
@@ -59,11 +64,6 @@ fn main() {
 
     conductor.write_pid_file();
     eprintln!("Conductor listening on {}", conductor.socket_path);
-
-    // Clean up leftover files from previous run
-    if conductor.config.transport == protocol::TransportMode::Unix {
-        conductor.cleanup_runtime_dir();
-    }
 
     // Create reserve worker
     if let Err(e) = conductor.create_reserve_worker(None) {

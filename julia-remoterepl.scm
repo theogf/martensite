@@ -29,7 +29,7 @@
   (cond
     [(path-exists? session-file)
      (define port (open-input-file session-file))
-     (define name (string-trim (read-line port)))
+     (define name (trim (read-line port)))
      (close-input-port port)
      name]
     [else
@@ -40,7 +40,7 @@
            unwrap-ok
            wait->stdout
            unwrap-ok
-           string-trim))
+           trim))
      (if (equal? zellij-name "") (get-helix-cwd) zellij-name)]))
 
 ;; ─── Sending code ────────────────────────────────────────────────────────────

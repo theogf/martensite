@@ -46,6 +46,21 @@ The Rust binaries are fully compatible with DaemonicCabal's Julia worker (`Daemo
 | `JULIA_DAEMON_WORKER_MAXCLIENTS` | `1` | Max clients per worker |
 | `JULIA_DAEMON_WORKER_TTL` | `7200` | Worker idle timeout (seconds) |
 
+### Installation
+
+```bash
+./install.sh            # build release, install service + symlink
+./install.sh uninstall  # remove everything
+```
+
+What it does (mirroring `DaemonicCabal.install()`):
+1. `cargo build --release`
+2. Copies binaries + worker project to `~/.local/share/julia-daemon/`
+3. Writes `~/.config/systemd/user/julia-daemon.service` and enables it
+4. Symlinks `juliaclient` → `~/.local/bin/juliaclient`
+
+Set `JULIA_DAEMONICABAL_DIR` if your DaemonicCabal checkout is not at `~/.julia/dev/DaemonicCabal`.
+
 ### Design notes
 
 - **No async runtime** — synchronous I/O matches the Zig single-threaded model and keeps `fork()` safe for sandbox spawning.
