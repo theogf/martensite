@@ -45,12 +45,11 @@
 
 ;; ─── Sending code ────────────────────────────────────────────────────────────
 
-;; Pipe code as stdin to juliaclient, capture and return stdout.
+;; Send code via --eval so DaemonWorker can echo it in the REPL (sync_echo_expressions).
+;; --sync makes the code appear in the interactive REPL session as "julia> <code>".
 (define (run-juliaclient session code)
-  (define stdin-port (open-input-string code))
   (define process
-    (~> (command "juliaclient" (list "--session" session))
-        (with-stdin stdin-port)
+    (~> (command "juliaclient" (list (string-append "--session=" session) "--sync" "--eval" code))
         with-stdout-piped
         spawn-process
         unwrap-ok))
@@ -85,7 +84,7 @@
 ;; Send the current selection to the running DaemonicCabal.jl server.
 ;; On failure, copies a server startup command to the clipboard.
 (define (send-to-julia-repl)
-  (define code (current-selection->string))
+  (define code (string-join (register->value #\.) "\n"))
   (cond
     [(or (not code) (equal? code ""))
      (set-warning! "julia-remoterepl: nothing selected")]
