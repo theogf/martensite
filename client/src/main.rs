@@ -95,7 +95,7 @@ fn set_raw_mode(raw: bool) {
 }
 
 fn is_tty(fd: i32) -> bool {
-    terminal_size(fd).is_some()
+    unsafe { libc::isatty(fd) != 0 }
 }
 
 fn terminal_size(fd: i32) -> Option<(u16, u16)> {
@@ -148,7 +148,7 @@ fn default_runtime_dir(xdg: Option<&str>, home: Option<&str>) -> String {
 
 // --- Low-level I/O ---
 
-fn write_fd(fd: i32, data: &[u8]) {
+pub(crate) fn write_fd(fd: i32, data: &[u8]) {
     let mut written = 0;
     while written < data.len() {
         let n = unsafe {
@@ -511,7 +511,9 @@ impl SignalParser {
             let data_len = self.buf[pos + 1] as usize;
             if pos + 2 + data_len > self.buf.len() { break; }
             let data = self.buf[pos + 2..pos + 2 + data_len].to_vec();
-            result = self.dispatch(id, &data, signals_fd);
+            if let Some(code) = self.dispatch(id, &data, signals_fd) {
+                result = Some(code);
+            }
             pos += 2 + data_len;
         }
         self.buf.drain(..pos);
@@ -627,146 +629,81 @@ fn run_event_loop(sockets: &WorkerSockets, sync_mode: bool) -> u8 {
     let mut stderr_buf = [0u8; BUF_SIZE];
     let mut sig_buf    = [0u8; BUF_SIZE];
 
-    // Use epoll for efficient multiplexing on Linux
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::io::RawFd;
+    let mut stdin_open = true;
+    let mut signals_open = true;
 
-        let epoll_fd = unsafe { libc::epoll_create1(0) };
-        if epoll_fd < 0 {
-            eprintln!("epoll_create1 failed");
-            std::process::exit(1);
+    loop {
+        let mut fds = [
+            libc::pollfd { fd: if stdin_open { libc::STDIN_FILENO } else { -1 },
+                           events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: sockets.stdout_fd,  events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: sockets.stderr_fd,  events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: if signals_open { sockets.signals_fd } else { -1 },
+                           events: libc::POLLIN, revents: 0 },
+        ];
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+        if n < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted { continue; }
+            break;
         }
 
-        let add_fd = |epoll: i32, fd: RawFd, id: u64| {
-            let mut ev = libc::epoll_event { events: libc::EPOLLIN as u32, u64: id };
-            unsafe { libc::epoll_ctl(epoll, libc::EPOLL_CTL_ADD, fd, &mut ev); }
-        };
-
-        const ID_STDIN:   u64 = 0;
-        const ID_STDOUT:  u64 = 1;
-        const ID_STDERR:  u64 = 2;
-        const ID_SIGNALS: u64 = 3;
-
-        add_fd(epoll_fd, libc::STDIN_FILENO, ID_STDIN);
-        add_fd(epoll_fd, sockets.stdout_fd, ID_STDOUT);
-        add_fd(epoll_fd, sockets.stderr_fd, ID_STDERR);
-        add_fd(epoll_fd, sockets.signals_fd, ID_SIGNALS);
-
-        let mut events = [libc::epoll_event { events: 0, u64: 0 }; 16];
-
-        'outer: loop {
-            let n = unsafe {
-                libc::epoll_wait(epoll_fd, events.as_mut_ptr(), events.len() as i32, -1)
-            };
-            if n < 0 {
-                let e = unsafe { *libc::__errno_location() };
-                if e == libc::EINTR { continue; }
-                break;
-            }
-            for event in &events[..n as usize] {
-                match event.u64 {
-                    ID_STDIN => {
-                        let n = unsafe { libc::read(libc::STDIN_FILENO, stdin_buf.as_mut_ptr() as *mut _, BUF_SIZE) };
-                        if n <= 0 {
-                            // stdin closed: close worker stdin
-                            unsafe { libc::shutdown(sockets.stdin_fd, libc::SHUT_WR); }
-                            unsafe { libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_DEL, libc::STDIN_FILENO, std::ptr::null_mut()); }
-                            continue;
-                        }
-                        if exit_code.is_some() { continue; }
-                        let data = &stdin_buf[..n as usize];
-                        if sync_mode && !signal_parser.worker_wants_raw {
-                            // Cooked mode emulation
-                            for &byte in data {
-                                if let Some(to_send) = cooked_state.process(byte, libc::STDOUT_FILENO) {
-                                    if to_send.is_empty() {
-                                        unsafe { libc::shutdown(sockets.stdin_fd, libc::SHUT_WR); }
-                                    } else {
-                                        write_fd(sockets.stdin_fd, &to_send);
-                                    }
-                                }
+        // stdin → worker stdin
+        if fds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+            let n = unsafe { libc::read(libc::STDIN_FILENO, stdin_buf.as_mut_ptr() as *mut _, BUF_SIZE) };
+            if n <= 0 {
+                stdin_open = false;
+                unsafe { libc::shutdown(sockets.stdin_fd, libc::SHUT_WR); }
+            } else if exit_code.is_none() {
+                let data = &stdin_buf[..n as usize];
+                if sync_mode && !signal_parser.worker_wants_raw {
+                    for &byte in data {
+                        if let Some(to_send) = cooked_state.process(byte, libc::STDOUT_FILENO) {
+                            if to_send.is_empty() {
+                                unsafe { libc::shutdown(sockets.stdin_fd, libc::SHUT_WR); }
+                                stdin_open = false;
+                                break;
+                            } else {
+                                write_fd(sockets.stdin_fd, &to_send);
                             }
-                        } else {
-                            write_fd(sockets.stdin_fd, data);
                         }
                     }
-                    ID_STDOUT => {
-                        let n = unsafe { libc::read(sockets.stdout_fd, stdout_buf.as_mut_ptr() as *mut _, BUF_SIZE) };
-                        if n <= 0 { stdout_eof = true; continue; }
-                        write_fd(libc::STDOUT_FILENO, &stdout_buf[..n as usize]);
-                    }
-                    ID_STDERR => {
-                        let n = unsafe { libc::read(sockets.stderr_fd, stderr_buf.as_mut_ptr() as *mut _, BUF_SIZE) };
-                        if n <= 0 { stderr_eof = true; continue; }
-                        write_fd(libc::STDERR_FILENO, &stderr_buf[..n as usize]);
-                    }
-                    ID_SIGNALS => {
-                        let n = unsafe { libc::read(sockets.signals_fd, sig_buf.as_mut_ptr() as *mut _, BUF_SIZE) };
-                        if n <= 0 {
-                            if exit_code.is_none() { exit_code = Some(1); }
-                            // Remove from epoll so we don't busy-loop
-                            unsafe { libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_DEL, sockets.signals_fd, std::ptr::null_mut()); }
-                            continue;
-                        }
-                        if let Some(code) = signal_parser.feed(&sig_buf[..n as usize], sockets.signals_fd) {
-                            exit_code = Some(code);
-                            // Remove signals from epoll
-                            unsafe { libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_DEL, sockets.signals_fd, std::ptr::null_mut()); }
-                        }
-                    }
-                    _ => {}
+                } else {
+                    write_fd(sockets.stdin_fd, data);
                 }
-                if exit_code.is_some() && stdout_eof && stderr_eof {
-                    break 'outer;
-                }
-            }
-            if exit_code.is_some() && stdout_eof && stderr_eof {
-                break;
             }
         }
-        unsafe { libc::close(epoll_fd); }
-    }
 
-    // Fallback: poll-based for non-Linux
-    #[cfg(not(target_os = "linux"))]
-    {
-        loop {
-            let mut fds = [
-                libc::pollfd { fd: libc::STDIN_FILENO, events: libc::POLLIN, revents: 0 },
-                libc::pollfd { fd: sockets.stdout_fd,   events: libc::POLLIN, revents: 0 },
-                libc::pollfd { fd: sockets.stderr_fd,   events: libc::POLLIN, revents: 0 },
-                libc::pollfd { fd: sockets.signals_fd,  events: libc::POLLIN, revents: 0 },
-            ];
-            let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, -1) };
-            if n < 0 { break; }
-
-            if fds[0].revents & libc::POLLIN != 0 {
-                let n = unsafe { libc::read(libc::STDIN_FILENO, stdin_buf.as_mut_ptr() as *mut _, BUF_SIZE) };
-                if n > 0 && exit_code.is_none() {
-                    write_fd(sockets.stdin_fd, &stdin_buf[..n as usize]);
-                }
-            }
-            if fds[1].revents & libc::POLLIN != 0 {
-                let n = unsafe { libc::read(sockets.stdout_fd, stdout_buf.as_mut_ptr() as *mut _, BUF_SIZE) };
-                if n <= 0 { stdout_eof = true; }
-                else { write_fd(libc::STDOUT_FILENO, &stdout_buf[..n as usize]); }
-            }
-            if fds[2].revents & libc::POLLIN != 0 {
-                let n = unsafe { libc::read(sockets.stderr_fd, stderr_buf.as_mut_ptr() as *mut _, BUF_SIZE) };
-                if n <= 0 { stderr_eof = true; }
-                else { write_fd(libc::STDERR_FILENO, &stderr_buf[..n as usize]); }
-            }
-            if fds[3].revents & libc::POLLIN != 0 {
-                let n = unsafe { libc::read(sockets.signals_fd, sig_buf.as_mut_ptr() as *mut _, BUF_SIZE) };
-                if n <= 0 {
-                    if exit_code.is_none() { exit_code = Some(1); }
-                } else if let Some(code) = signal_parser.feed(&sig_buf[..n as usize], sockets.signals_fd) {
-                    exit_code = Some(code);
-                }
-            }
-            if exit_code.is_some() && stdout_eof && stderr_eof { break; }
+        // worker stdout → terminal stdout
+        if fds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+            let n = unsafe { libc::read(sockets.stdout_fd, stdout_buf.as_mut_ptr() as *mut _, BUF_SIZE) };
+            if n <= 0 { stdout_eof = true; }
+            else { write_fd(libc::STDOUT_FILENO, &stdout_buf[..n as usize]); }
         }
+
+        // worker stderr → terminal stderr
+        if fds[2].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+            let n = unsafe { libc::read(sockets.stderr_fd, stderr_buf.as_mut_ptr() as *mut _, BUF_SIZE) };
+            if n <= 0 { stderr_eof = true; }
+            else { write_fd(libc::STDERR_FILENO, &stderr_buf[..n as usize]); }
+        }
+
+        // signals socket
+        if fds[3].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+            let n = unsafe { libc::read(sockets.signals_fd, sig_buf.as_mut_ptr() as *mut _, BUF_SIZE) };
+            if n <= 0 {
+                signals_open = false;
+                if exit_code.is_none() {
+                    // Drain any complete frames buffered from earlier partial reads.
+                    exit_code = Some(signal_parser.process(sockets.signals_fd).unwrap_or(1));
+                }
+            } else if let Some(code) = signal_parser.feed(&sig_buf[..n as usize], sockets.signals_fd) {
+                exit_code = Some(code);
+                signals_open = false;
+            }
+        }
+
+        if exit_code.is_some() && stdout_eof && stderr_eof { break; }
     }
 
     exit_code.unwrap_or(1)

@@ -18,12 +18,12 @@ impl CookedState {
                 // Backspace
                 if !self.line_buf.is_empty() {
                     self.line_buf.pop();
-                    write_fd(local_stdout_fd, b"\x08 \x08");
+                    super::write_fd(local_stdout_fd, b"\x08 \x08");
                 }
                 None
             }
             b'\r' | b'\n' => {
-                write_fd(local_stdout_fd, b"\r\n");
+                super::write_fd(local_stdout_fd, b"\r\n");
                 let mut to_send = self.line_buf.clone();
                 to_send.push(b'\n');
                 self.line_buf.clear();
@@ -45,17 +45,11 @@ impl CookedState {
             b if b >= 0x20 => {
                 if self.line_buf.len() < 4096 {
                     self.line_buf.push(b);
-                    write_fd(local_stdout_fd, &[b]);
+                    super::write_fd(local_stdout_fd, &[b]);
                 }
                 None
             }
             _ => None,
         }
-    }
-}
-
-fn write_fd(fd: i32, data: &[u8]) {
-    unsafe {
-        libc::write(fd, data.as_ptr() as *const _, data.len());
     }
 }
