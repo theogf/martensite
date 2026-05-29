@@ -1,3 +1,3 @@
-(define package-name 'julia-remoterepl)
+(define package-name 'martensite)
 (define version "0.1.0")
 (define dependencies '())

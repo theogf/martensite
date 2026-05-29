@@ -8,6 +8,8 @@ if [[ -f ".juliasession" ]]; then
     session=$(head -1 .juliasession)
 elif [[ -n "$ZELLIJ" ]]; then
     session=$(zellij action current-tab-info | head -1 | cut -c7-)
+elif [[ -n "$TMUX" ]]; then
+    session=$(tmux display-message -p '#W')
 else
     session=$(pwd)
 fi

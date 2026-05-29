@@ -1,7 +1,7 @@
-;;; julia-remoterepl.scm
+;;; martensite.scm
 ;;; Steel plugin for Helix: send current selection to a DaemonicCabal.jl server.
 ;;;
-;;; Requires `juliaclient` to be on PATH.
+;;; Requires `temper` to be on PATH.
 ;;; Default keybinding: C-j (normal and select modes), C-S-j for top-level
 
 (require "helix/misc.scm")        ; set-status!, set-warning!, set-error!, cursor-position
@@ -21,35 +21,12 @@
 
 (define *julia-output-file* "/tmp/martensite-output.txt")
 
-;; ─── Session ─────────────────────────────────────────────────────────────────
-
-;; Session cascade: .juliasession file → zellij tab name → CWD.
-(define (get-session)
-  (define session-file (string-append (get-helix-cwd) "/.juliasession"))
-  (cond
-    [(path-exists? session-file)
-     (define port (open-input-file session-file))
-     (define name (trim (read-line port)))
-     (close-input-port port)
-     name]
-    [else
-     (define zellij-name
-       (~> (command "sh" (list "-c" "zellij action current-tab-info | head -1 | cut -c7-"))
-           with-stdout-piped
-           spawn-process
-           unwrap-ok
-           wait->stdout
-           unwrap-ok
-           trim))
-     (if (equal? zellij-name "") (get-helix-cwd) zellij-name)]))
-
 ;; ─── Sending code ────────────────────────────────────────────────────────────
 
-;; Send code via --eval so DaemonWorker can echo it in the REPL (sync_echo_expressions).
-;; --sync makes the code appear in the interactive REPL session as "julia> <code>".
-(define (run-juliaclient session code)
+;; temper resolves the session and passes --sync --eval to juliaclient.
+(define (run-temper code)
   (define process
-    (~> (command "juliaclient" (list (string-append "--session=" session) "--sync" "--eval" code))
+    (~> (command "temper" (list code))
         with-stdout-piped
         spawn-process
         unwrap-ok))
@@ -65,18 +42,17 @@
   (helix.vsplit)
   (helix.open *julia-output-file*))
 
-;; Send code string to juliaclient and display output.
+;; Send code string via temper and display output.
 (define (send-code! code)
-  (define session (get-session))
   (spawn-native-thread
     (lambda ()
-      (define output (run-juliaclient session code))
+      (define output (run-temper code))
       (hx.with-context
         (lambda ()
           (if (equal? output "")
-              (set-status! "julia-remoterepl: done (no output)")
+              (set-status! "martensite: done (no output)")
               (show-output! output))))))
-  (set-status! "julia-remoterepl: sending…"))
+  (set-status! "martensite: sending…"))
 
 ;; ─── Main commands ───────────────────────────────────────────────────────────
 
@@ -87,7 +63,7 @@
   (define code (string-join (register->value #\.) "\n"))
   (cond
     [(or (not code) (equal? code ""))
-     (set-warning! "julia-remoterepl: nothing selected")]
+     (set-warning! "martensite: nothing selected")]
     [else
      (send-code! code)]))
 
@@ -107,7 +83,7 @@
   (define tree (document->tree doc-id))
   (cond
     [(not tree)
-     (set-warning! "julia-remoterepl: no tree-sitter tree for this buffer")]
+     (set-warning! "martensite: no tree-sitter tree for this buffer")]
     [else
      (define rope (editor->text doc-id))
      (define cursor-char (cursor-position))
@@ -117,7 +93,7 @@
        (tsnode-named-descendant-byte-range root cursor-byte cursor-byte))
      (cond
        [(not node-at-cursor)
-        (set-warning! "julia-remoterepl: no node at cursor")]
+        (set-warning! "martensite: no node at cursor")]
        [else
         (define top-node (find-top-level-node node-at-cursor))
         (define start-byte (tsnode-start-byte top-node))
@@ -125,6 +101,6 @@
         (define code (rope->string (rope->byte-slice rope start-byte end-byte)))
         (cond
           [(or (not code) (equal? code ""))
-           (set-warning! "julia-remoterepl: top-level node is empty")]
+           (set-warning! "martensite: top-level node is empty")]
           [else
            (send-code! code)])])]))

@@ -58,7 +58,7 @@ What it does (mirroring `DaemonicCabal.install()`):
 2. Copies binaries + worker project to `~/.local/share/julia-daemon/`
 3. Writes `~/.config/systemd/user/julia-daemon.service` and enables it
 4. Symlinks `juliaclient` → `~/.local/bin/juliaclient`
-5. Copies `julia-session.sh` → `~/.local/bin/julia-session`
+5. Copies `quench.sh` → `~/.local/bin/quench`
 
 Set `JULIA_DAEMONICABAL_DIR` if your DaemonicCabal checkout is not at `~/.julia/dev/DaemonicCabal`.
 

@@ -19,24 +19,24 @@ Follow the instructions [here](https://github.com/mattwparas/helix/blob/steel-ev
 > export HELIX_RUNTIME=/path/to/helix/runtime
 > ```
 
-### 2. DaemonicCabal.jl
+### 2. Julia conductor/client
 
-This repo ships Rust rewrites of the DaemonicCabal conductor and client binaries, derived directly from the [Zig implementation](https://github.com/tecosaur/DaemonicCabal.jl) and wire-compatible with the Julia worker. Build and install them with:
+This repo ships Rust rewrites of the [DaemonicCabal](https://github.com/tecosaur/DaemonicCabal.jl) conductor and client binaries, derived directly from the Zig implementation and wire-compatible with the Julia worker. Build and install them with:
 
 ```sh
 ./install.sh
 ```
 
-This builds the binaries, installs the systemd user service, and symlinks `juliaclient` and `julia-session` to `~/.local/bin/`.
+This builds the binaries, installs the systemd user service, and symlinks `juliaclient` and `quench` to `~/.local/bin/`.
 
 See [CLAUDE.md](CLAUDE.md) for details on the Rust binaries and protocol.
 
 ### 3. Starting a Julia session
 
-Use the provided `julia-session` script, which resolves the session name automatically (see [Session resolution](#session-resolution)):
+Use the provided `quench` script, which resolves the session name automatically (see [Session resolution](#session-resolution)):
 
 ```sh
-julia-session
+quench
 ```
 
 Set this as the command for your Julia pane in your Zellij/Tmux layout.
@@ -46,7 +46,7 @@ Set this as the command for your Julia pane in your Zellij/Tmux layout.
 Require the plugin from your Helix `init.scm` (`~/.config/helix/init.scm`):
 
 ```scheme
-(require "/path/to/martensite/julia-remoterepl.scm")
+(require "/path/to/martensite/martensite.scm")
 ```
 
 ## Usage
@@ -77,10 +77,11 @@ Output from the Julia session is shown in a vsplit buffer.
 
 ## Session resolution
 
-Both the Helix plugin and `julia-session` resolve the session name using the same cascade:
+Both the Helix plugin and `quench`/`temper` resolve the session name using the same cascade:
 
 1. **`.juliasession` file** — if a `.juliasession` file exists in the project root, its first line is used as the session name.
 2. **Zellij tab name** — if running inside Zellij, the current tab name is used.
-3. **Working directory** — fallback to the CWD of the Helix process.
+3. **Tmux window name** — if running inside tmux, the current window name is used.
+4. **Working directory** — fallback to the CWD of the Helix process.
 
-Name your Zellij tabs meaningfully and both sides will find each other automatically.
+Name your Zellij tabs or tmux windows meaningfully and both sides will find each other automatically.

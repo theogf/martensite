@@ -21,8 +21,10 @@ WORKER_PROJECT_DST="$INSTALL_DIR/worker"
 CONDUCTOR_DST="$INSTALL_DIR/julia-conductor"
 CLIENT_DST="$INSTALL_DIR/juliaclient"
 CLIENT_SYMLINK="$XDG_BIN_HOME/juliaclient"
-SESSION_SCRIPT_SRC="$SCRIPT_DIR/julia-session.sh"
-SESSION_SCRIPT_DST="$XDG_BIN_HOME/julia-session"
+SESSION_SCRIPT_SRC="$SCRIPT_DIR/quench.sh"
+SESSION_SCRIPT_DST="$XDG_BIN_HOME/quench"
+TEMPER_SCRIPT_SRC="$SCRIPT_DIR/temper.sh"
+TEMPER_SCRIPT_DST="$XDG_BIN_HOME/temper"
 
 SERVICE_NAME="julia-daemon"
 SERVICE_FILE="$XDG_CONFIG_HOME/systemd/user/$SERVICE_NAME.service"
@@ -50,6 +52,11 @@ do_uninstall() {
     if [[ -L "$SESSION_SCRIPT_DST" || -f "$SESSION_SCRIPT_DST" ]]; then
         echo "Removing $SESSION_SCRIPT_DST"
         rm -f "$SESSION_SCRIPT_DST"
+    fi
+
+    if [[ -L "$TEMPER_SCRIPT_DST" || -f "$TEMPER_SCRIPT_DST" ]]; then
+        echo "Removing $TEMPER_SCRIPT_DST"
+        rm -f "$TEMPER_SCRIPT_DST"
     fi
 
     if [[ -d "$INSTALL_DIR" ]]; then
@@ -134,7 +141,11 @@ echo "Symlinked juliaclient → $CLIENT_SYMLINK"
 
 cp "$SESSION_SCRIPT_SRC" "$SESSION_SCRIPT_DST"
 chmod 755 "$SESSION_SCRIPT_DST"
-echo "Installed julia-session → $SESSION_SCRIPT_DST"
+echo "Installed quench → $SESSION_SCRIPT_DST"
+
+cp "$TEMPER_SCRIPT_SRC" "$TEMPER_SCRIPT_DST"
+chmod 755 "$TEMPER_SCRIPT_DST"
+echo "Installed temper → $TEMPER_SCRIPT_DST"
 
 echo ""
 echo "Done. Make sure $XDG_BIN_HOME is on your PATH."
