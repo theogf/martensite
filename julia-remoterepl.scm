@@ -19,7 +19,7 @@
 (provide send-to-julia-repl)
 (provide send-top-level-to-julia-repl)
 
-(define *julia-output-file* "/tmp/julia-steel-output.txt")
+(define *julia-output-file* "/tmp/martensite-output.txt")
 
 ;; ─── Session ─────────────────────────────────────────────────────────────────
 

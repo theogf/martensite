@@ -1,4 +1,4 @@
-# julia-steel
+# martensite
 
 Steel plugin for Helix that sends Julia code to a DaemonicCabal.jl session.
 
@@ -49,7 +49,7 @@ The Rust binaries are fully compatible with DaemonicCabal's Julia worker (`Daemo
 ### Installation
 
 ```bash
-./install.sh            # build release, install service + symlink
+./install.sh            # build release, install service + symlinks
 ./install.sh uninstall  # remove everything
 ```
 
@@ -58,8 +58,22 @@ What it does (mirroring `DaemonicCabal.install()`):
 2. Copies binaries + worker project to `~/.local/share/julia-daemon/`
 3. Writes `~/.config/systemd/user/julia-daemon.service` and enables it
 4. Symlinks `juliaclient` → `~/.local/bin/juliaclient`
+5. Copies `julia-session.sh` → `~/.local/bin/julia-session`
 
 Set `JULIA_DAEMONICABAL_DIR` if your DaemonicCabal checkout is not at `~/.julia/dev/DaemonicCabal`.
+
+### DaemonicCabal patches
+
+The following bug fixes have been applied to `~/.julia/dev/DaemonicCabal/worker/src/setup.jl` and must be re-applied after any upstream update:
+
+**`dup: Bad file descriptor` on REPL exit** — on Julia < 1.11, `redirect_stdio` cleanup calls `dup` on a file descriptor that is already closed when the client disconnects. Fix: catch the specific `SystemError` in the spawned client task:
+
+```julia
+catch err
+    err isa Base.SystemError && occursin("dup", err.msg) && return
+    isopen(client_stdout) && rethrow()
+end
+```
 
 ### Design notes
 

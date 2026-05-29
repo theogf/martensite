@@ -1,9 +1,11 @@
-# julia-steel
+# martensite
 
-A [Steel](https://github.com/mattwparas/steel) plugin for [Helix](https://helix-editor.com) that sends the current selection to a running [DaemonicCabal.jl](https://github.com/tecosaur/DaemonicCabal.jl) session.
+> *Martensite* is the hardest phase of steel, formed by rapidly quenching austenite — a metaphor for JIT-compiled Julia hardened through the Steel scripting layer.
+
+A [Steel](https://github.com/mattwparas/steel) plugin for [Helix](https://helix-editor.com) that sends Julia code to a running [DaemonicCabal.jl](https://github.com/tecosaur/DaemonicCabal.jl) session.
 
 > [!WARNING]
-> Getting this setup requires advanced knowledge in git and linux setup 
+> Getting this setup requires advanced knowledge in git and linux setup
 
 ## Prerequisites
 
@@ -19,34 +21,32 @@ Follow the instructions [here](https://github.com/mattwparas/helix/blob/steel-ev
 
 ### 2. DaemonicCabal.jl
 
-Install DaemonicCabal into your global Julia environment so `juliaclient` is available system-wide:
+This repo ships Rust rewrites of the DaemonicCabal conductor and client binaries, derived directly from the [Zig implementation](https://github.com/tecosaur/DaemonicCabal.jl) and wire-compatible with the Julia worker. Build and install them with:
 
 ```sh
-julia --startup-file=no -e 'using Pkg; Pkg.dev(url="https://github.com/tecosaur/DaemonicCabal.jl")'
+./install.sh
 ```
 
-Make sure `juliaclient` ends up on your `PATH` (check `DaemonicCabal`'s README for the exact build/install step for the Zig client binary).
+This builds the binaries, installs the systemd user service, and symlinks `juliaclient` and `julia-session` to `~/.local/bin/`.
+
+See [CLAUDE.md](CLAUDE.md) for details on the Rust binaries and protocol.
 
 ### 3. Starting a Julia session
 
-Launch Julia through `juliaclient` so it runs inside a DaemonicCabal-managed worker for your project. The session name must match what the plugin resolves (see [Session resolution](#session-resolution) below).
+Use the provided `julia-session` script, which resolves the session name automatically (see [Session resolution](#session-resolution)):
 
 ```sh
-juliaclient --session <name> --sync -i
+julia-session
 ```
 
-This can be e.g. set up in your Zellij/Tmux layout. With Zellij, use the tab name:
-
-```sh
-juliaclient --session "$(zellij action current-tab-info | head -1 | cut -c7-)" --sync -i
-```
+Set this as the command for your Julia pane in your Zellij/Tmux layout.
 
 ## Installation
 
 Require the plugin from your Helix `init.scm` (`~/.config/helix/init.scm`):
 
 ```scheme
-(require "/path/to/julia-steel/julia-remoterepl.scm")
+(require "/path/to/martensite/julia-remoterepl.scm")
 ```
 
 ## Usage
@@ -55,8 +55,8 @@ Two commands are available:
 
 | Command | Description |
 |---|---|
-| `send-to-julia-repl` | Send the current selection |
-| `send-top-level-to-julia-repl` | Send the top-level form under the cursor (uses tree-sitter) |
+| `send-to-julia-repl` | Send the last-yanked text (`"` register) to the session |
+| `send-top-level-to-julia-repl` | Send the top-level tree-sitter form under the cursor |
 
 Bind them in `~/.config/helix/config.toml`:
 
@@ -69,16 +69,18 @@ C-S-j = ":send-top-level-to-julia-repl"
 C-j = ":send-to-julia-repl"
 ```
 
-`send-to-julia-repl` sends whatever is selected. `send-top-level-to-julia-repl` walks the tree-sitter parse tree upward from the cursor until it reaches the top-level node (e.g. a full function definition or `begin` block), then sends that — no manual selection required.
+**Workflow:**
+- `send-to-julia-repl` — yank the code you want to send (`y`), then press `C-j`
+- `send-top-level-to-julia-repl` — place the cursor anywhere inside a function/block and press `C-S-j`; it walks the tree-sitter parse tree up to the top-level node and sends it automatically
 
 Output from the Julia session is shown in a vsplit buffer.
 
-On failure the status bar shows an error and copies a startup command to the clipboard.
-
 ## Session resolution
 
-The plugin resolves the session name using the following cascade:
+Both the Helix plugin and `julia-session` resolve the session name using the same cascade:
 
-1. **`.juliasession` file** — if a `.juliasession` file exists in the project root, its first line is used as the session name. Useful for projects that always connect to a named session regardless of environment.
-2. **Zellij tab name** — if running inside Zellij, the current tab name is used. Name your tabs meaningfully and start Julia with the matching name.
+1. **`.juliasession` file** — if a `.juliasession` file exists in the project root, its first line is used as the session name.
+2. **Zellij tab name** — if running inside Zellij, the current tab name is used.
 3. **Working directory** — fallback to the CWD of the Helix process.
+
+Name your Zellij tabs meaningfully and both sides will find each other automatically.
