@@ -1,5 +1,7 @@
 # martensite
 
+[![Docs](https://img.shields.io/badge/docs-architecture-blue?style=flat-square)](https://theogf.dev/martensite/architecture.html)
+
 > *Martensite* is the hardest phase of steel, formed by rapidly quenching austenite — a metaphor for JIT-compiled Julia hardened through the Steel scripting layer.
 
 A [Steel](https://github.com/mattwparas/steel) plugin for [Helix](https://helix-editor.com) that sends Julia code to a running [DaemonicCabal.jl](https://github.com/tecosaur/DaemonicCabal.jl) session.
