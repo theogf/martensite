@@ -277,3 +277,171 @@ pub fn set_tcp_nodelay_raw(fd: std::os::unix::io::RawFd) {
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worker_message_type_round_trips_all_variants() {
+        use worker::MessageType::*;
+        for (byte, variant) in [
+            (0x01u8, Ping), (0x02, Pong),
+            (0x10, SetProject), (0x11, ProjectOk),
+            (0x20, ClientRun), (0x21, Sockets),
+            (0x30, QueryState), (0x31, State),
+            (0x32, QueryClients), (0x33, Clients),
+            (0x40, SoftExit), (0x41, Ack),
+            (0x50, SyncClients), (0x51, DropSession),
+        ] {
+            assert_eq!(worker::MessageType::from_u8(byte), variant);
+        }
+    }
+
+    #[test]
+    fn worker_message_type_unknown_byte_is_err() {
+        assert_eq!(worker::MessageType::from_u8(0x99), worker::MessageType::Err);
+    }
+
+    #[test]
+    fn notification_type_round_trips_all_variants() {
+        use notification::Type::*;
+        for (byte, variant) in [
+            (0x01u8, ClientDone),
+            (0x02, WorkerUnresponsive),
+            (0x03, WorkerExit),
+            (0x04, ClientExit),
+            (0x05, ClientInterrupt),
+        ] {
+            assert_eq!(notification::Type::from_u8(byte), Some(variant));
+        }
+    }
+
+    #[test]
+    fn notification_type_unknown_byte_is_none() {
+        assert_eq!(notification::Type::from_u8(0x99), None);
+    }
+
+    #[test]
+    fn client_flags_tty_bit() {
+        assert!(client::Flags(1).is_tty());
+        assert!(!client::Flags(0).is_tty());
+        assert_eq!(client::Flags::new(true), 1);
+        assert_eq!(client::Flags::new(false), 0);
+    }
+
+    #[test]
+    fn worker_flags_pack_tty_and_force_independently() {
+        assert_eq!(worker::Flags::new(false, false), 0);
+        assert_eq!(worker::Flags::new(true, false), 1);
+        assert_eq!(worker::Flags::new(false, true), 2);
+        assert_eq!(worker::Flags::new(true, true), 3);
+    }
+
+    #[test]
+    fn parse_address_tcp_scheme() {
+        let a = parse_address("tcp://127.0.0.1:9345").unwrap();
+        assert_eq!(a.mode, TransportMode::Tcp);
+        assert_eq!(a.addr, "127.0.0.1:9345");
+    }
+
+    #[test]
+    fn parse_address_bare_host_port_is_tcp() {
+        let a = parse_address("localhost:9345").unwrap();
+        assert_eq!(a.mode, TransportMode::Tcp);
+    }
+
+    #[test]
+    fn parse_address_path_is_unix() {
+        let a = parse_address("/run/user/1000/julia-daemon/conductor.sock").unwrap();
+        assert_eq!(a.mode, TransportMode::Unix);
+    }
+
+    #[test]
+    fn parse_address_relative_path_is_unix() {
+        let a = parse_address("./conductor.sock").unwrap();
+        assert_eq!(a.mode, TransportMode::Unix);
+    }
+
+    #[test]
+    fn parse_address_rejects_unknown_scheme() {
+        assert!(parse_address("http://example.com").is_err());
+    }
+
+    #[test]
+    fn parse_host_port_explicit_port() {
+        let addr = parse_host_port("127.0.0.1:1234").unwrap();
+        assert_eq!(addr.port(), 1234);
+    }
+
+    #[test]
+    fn parse_host_port_defaults_when_missing() {
+        let addr = parse_host_port("127.0.0.1").unwrap();
+        assert_eq!(addr.port(), DEFAULT_TCP_PORT);
+    }
+
+    #[test]
+    fn parse_host_port_rejects_bad_port() {
+        assert!(parse_host_port("127.0.0.1:not-a-port").is_err());
+    }
+
+    #[test]
+    fn parse_host_port_rejects_unresolvable_host() {
+        // parse_host_port only accepts numeric IP literals — DNS names fail
+        // at the final SocketAddr parse, not the port-splitting step.
+        assert!(parse_host_port("localhost:1234").is_err());
+    }
+
+    #[test]
+    fn port_pool_allocate_and_release() {
+        let mut pool = PortPool::new(10000, 2);
+        let a = pool.allocate().unwrap();
+        let b = pool.allocate().unwrap();
+        assert_ne!(a, b);
+        assert!(pool.allocate().is_none()); // exhausted
+        pool.release(a);
+        assert_eq!(pool.allocate(), Some(a)); // reused after release
+    }
+
+    #[test]
+    fn port_pool_ports_for_index_are_four_apart() {
+        let pool = PortPool::new(10000, 4);
+        assert_eq!(pool.ports_for_index(0), [10000, 10001, 10002, 10003]);
+        assert_eq!(pool.ports_for_index(1), [10004, 10005, 10006, 10007]);
+    }
+
+    #[test]
+    fn parse_port_range_valid() {
+        assert_eq!(parse_port_range("10000-10015"), Some((10000, 4)));
+    }
+
+    #[test]
+    fn parse_port_range_invalid_or_too_narrow() {
+        assert_eq!(parse_port_range("10000-10001"), None); // < 4 ports
+        assert_eq!(parse_port_range("10015-10000"), None); // high <= low
+        assert_eq!(parse_port_range("not-a-range"), None);
+    }
+
+    #[test]
+    fn is_loopback_v4() {
+        let addr: std::net::SocketAddr = "127.0.0.1:9345".parse().unwrap();
+        assert!(is_loopback(&addr));
+        let addr: std::net::SocketAddr = "10.0.0.1:9345".parse().unwrap();
+        assert!(!is_loopback(&addr));
+    }
+
+    #[test]
+    fn is_loopback_v6_mapped_v4() {
+        let addr: std::net::SocketAddr = "[::ffff:127.0.0.1]:9345".parse().unwrap();
+        assert!(is_loopback(&addr));
+    }
+
+    #[test]
+    fn random_socket_path_is_unique_and_uses_suffix() {
+        let a = random_socket_path("/run/user/1000/julia-daemon", "client");
+        let b = random_socket_path("/run/user/1000/julia-daemon", "client");
+        assert_ne!(a, b);
+        assert!(a.starts_with("/run/user/1000/julia-daemon/"));
+        assert!(a.ends_with("-client"));
+    }
+}

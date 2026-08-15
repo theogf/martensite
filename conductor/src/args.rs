@@ -168,3 +168,126 @@ pub fn parse(args: &[String]) -> ParsedArgs {
 
     ParsedArgs { julia_channel, switches, program_file, program_args }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_str(args: &[&str]) -> ParsedArgs {
+        // args[0] mirrors argv[0] (the program name), which parse() skips.
+        let owned: Vec<String> = std::iter::once("julia".to_string())
+            .chain(args.iter().map(|s| s.to_string()))
+            .collect();
+        parse(&owned)
+    }
+
+    #[test]
+    fn short_flag_glued_value() {
+        let parsed = parse_str(&["-t4"]);
+        assert_eq!(parsed.get_switch("--threads"), Some("4"));
+    }
+
+    #[test]
+    fn short_flag_equals_value() {
+        // Regression test for the bug where `-t=4` silently became `auto`
+        // because the leading `=` wasn't stripped before parsing the count.
+        let parsed = parse_str(&["-t=4"]);
+        assert_eq!(parsed.get_switch("--threads"), Some("4"));
+        assert_eq!(parsed.thread_switch(), [4, THREADS_UNSET]);
+    }
+
+    #[test]
+    fn short_flag_space_separated_value() {
+        let parsed = parse_str(&["-t", "4"]);
+        assert_eq!(parsed.get_switch("--threads"), Some("4"));
+    }
+
+    #[test]
+    fn long_flag_equals_value() {
+        let parsed = parse_str(&["--threads=4"]);
+        assert_eq!(parsed.get_switch("--threads"), Some("4"));
+    }
+
+    #[test]
+    fn short_flag_expands_to_long_name() {
+        let parsed = parse_str(&["-P", "MyProject"]);
+        assert!(parsed.has_switch("--project"));
+        assert_eq!(parsed.get_switch("--project"), Some("MyProject"));
+    }
+
+    #[test]
+    fn no_value_switch_takes_no_argument() {
+        let parsed = parse_str(&["-i", "script.jl"]);
+        assert_eq!(parsed.get_switch("-i"), Some(""));
+        assert_eq!(parsed.program_file.as_deref(), Some("script.jl"));
+    }
+
+    #[test]
+    fn optional_value_switch_without_equals_takes_no_argument() {
+        // --session with no `=value` must not swallow the next arg as its value.
+        let parsed = parse_str(&["--session", "script.jl"]);
+        assert_eq!(parsed.get_switch("--session"), Some(""));
+        assert_eq!(parsed.program_file.as_deref(), Some("script.jl"));
+    }
+
+    #[test]
+    fn get_switch_returns_last_occurrence() {
+        let parsed = parse_str(&["--threads=2", "--threads=4"]);
+        assert_eq!(parsed.get_switch("--threads"), Some("4"));
+    }
+
+    #[test]
+    fn julia_channel_prefix() {
+        let parsed = parse_str(&["+1.10", "script.jl"]);
+        assert_eq!(parsed.julia_channel.as_deref(), Some("+1.10"));
+        assert_eq!(parsed.program_file.as_deref(), Some("script.jl"));
+    }
+
+    #[test]
+    fn double_dash_marks_program_file() {
+        let parsed = parse_str(&["--", "script.jl", "--not-a-switch"]);
+        assert_eq!(parsed.program_file.as_deref(), Some("script.jl"));
+        assert_eq!(parsed.program_args, vec!["--not-a-switch".to_string()]);
+    }
+
+    #[test]
+    fn bare_positional_arg_is_program_file() {
+        let parsed = parse_str(&["script.jl", "arg1", "arg2"]);
+        assert_eq!(parsed.program_file.as_deref(), Some("script.jl"));
+        assert_eq!(parsed.program_args, vec!["arg1".to_string(), "arg2".to_string()]);
+    }
+
+    #[test]
+    fn thread_switch_defaults_to_none() {
+        let parsed = parse_str(&["script.jl"]);
+        assert_eq!(parsed.thread_switch(), THREADS_NONE);
+    }
+
+    #[test]
+    fn parse_threads_variants() {
+        assert_eq!(parse_threads(""), THREADS_NONE);
+        assert_eq!(parse_threads("4"), [4, THREADS_UNSET]);
+        assert_eq!(parse_threads("auto"), [THREADS_AUTO, THREADS_UNSET]);
+        assert_eq!(parse_threads("4,1"), [4, 1]);
+        assert_eq!(parse_threads("auto,2"), [THREADS_AUTO, 2]);
+        // Unrecognised fields fall back to auto rather than erroring.
+        assert_eq!(parse_threads("garbage"), [THREADS_AUTO, THREADS_UNSET]);
+    }
+
+    #[test]
+    fn render_threads_round_trip() {
+        assert_eq!(render_threads(THREADS_NONE), None);
+        assert_eq!(render_threads([4, THREADS_UNSET]), Some("4".to_string()));
+        assert_eq!(render_threads([THREADS_AUTO, THREADS_UNSET]), Some("auto".to_string()));
+        assert_eq!(render_threads([4, 1]), Some("4,1".to_string()));
+        assert_eq!(render_threads([THREADS_AUTO, 2]), Some("auto,2".to_string()));
+    }
+
+    #[test]
+    fn pack_threads_is_order_sensitive_and_distinct() {
+        let a = pack_threads([4, 1]);
+        let b = pack_threads([1, 4]);
+        assert_ne!(a, b);
+        assert_eq!(pack_threads(THREADS_NONE), 0);
+    }
+}

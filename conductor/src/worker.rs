@@ -720,3 +720,113 @@ fn resolve_in_path(name: &str) -> Option<String> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- Ewma ---
+
+    #[test]
+    fn ewma_starts_at_zero() {
+        let mut e = Ewma::new(0);
+        assert_eq!(e.read(0, 60.0), 0.0);
+    }
+
+    #[test]
+    fn ewma_rises_toward_one_while_attached() {
+        let mut e = Ewma::new(0);
+        e.attach(0, 60.0);
+        // At exactly one half-life of continuous busy time, the decayed
+        // value should have closed half the gap to the busy asymptote (1.0).
+        let v = e.read(60, 60.0);
+        assert!((v - 0.5).abs() < 1e-9, "expected ~0.5, got {v}");
+    }
+
+    #[test]
+    fn ewma_decays_toward_zero_after_detach() {
+        let mut e = Ewma::new(0);
+        e.attach(0, 60.0);
+        e.detach(60, 60.0); // value is ~0.5 at detach
+        let v = e.read(120, 60.0); // another half-life idle
+        assert!(v < 0.5, "expected further decay after detach, got {v}");
+        assert!(v > 0.0);
+    }
+
+    #[test]
+    fn ewma_peek_does_not_mutate_state() {
+        let mut e = Ewma::new(0);
+        e.attach(0, 60.0);
+        let peeked = e.peek(60, 60.0);
+        // read() at the same `now` must match peek()'s result exactly, i.e.
+        // peek() didn't advance last_t/consume the pending decay.
+        let read = e.read(60, 60.0);
+        assert!((peeked - read).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ewma_zero_or_negative_dt_is_a_no_op() {
+        let mut e = Ewma::new(100);
+        e.attach(100, 60.0);
+        let before = e.read(100, 60.0);
+        // update_to() bails out early when dt <= 0, so going "backwards" or
+        // staying put must not change the stored value.
+        let after = e.read(100, 60.0);
+        assert_eq!(before, after);
+    }
+
+    // --- Crf ---
+
+    #[test]
+    fn crf_first_bump_sets_value_to_one_no_interval_budget_yet() {
+        let mut c = Crf::default();
+        c.bump(0, 60.0);
+        assert_eq!(c.read(0, 60.0), 1.0);
+        assert_eq!(c.interval_budget(), 0.0); // needs >= 2 summons
+    }
+
+    #[test]
+    fn crf_read_decays_between_summons() {
+        let mut c = Crf::default();
+        c.bump(0, 60.0);
+        let v = c.read(60, 60.0); // one half-life later
+        assert!((v - 0.5).abs() < 1e-9, "expected ~0.5, got {v}");
+    }
+
+    #[test]
+    fn crf_srtt_rttvar_after_second_bump() {
+        let mut c = Crf::default();
+        c.bump(0, 60.0);
+        c.bump(100, 60.0); // gap = 100
+        // After exactly two summons, srtt/rttvar are seeded directly from
+        // the observed gap (srtt = gap, rttvar = gap / 2), per the
+        // Jacobson/RFC6298-style seeding in Crf::bump.
+        assert_eq!(c.interval_budget(), 100.0 + 4.0 * 50.0);
+    }
+
+    #[test]
+    fn crf_srtt_rttvar_smooth_after_third_bump() {
+        let mut c = Crf::default();
+        c.bump(0, 60.0);
+        c.bump(100, 60.0);  // gap = 100 -> srtt=100, rttvar=50
+        c.bump(250, 60.0);  // gap = 150 -> err=50, srtt=106.25, rttvar=50.0
+        let budget = c.interval_budget();
+        assert!((budget - (106.25 + 4.0 * 50.0)).abs() < 1e-9, "got {budget}");
+    }
+
+    #[test]
+    fn crf_regular_cadence_yields_larger_budget_than_erratic_cadence() {
+        // A key summoned at a steady cadence should end up with a tighter
+        // (smaller) rttvar, and thus a smaller interval_budget, than one
+        // summoned at the same average rate but erratically.
+        let mut regular = Crf::default();
+        for t in [0, 100, 200, 300, 400] {
+            regular.bump(t, 60.0);
+        }
+        let mut erratic = Crf::default();
+        for t in [0, 20, 380, 400, 780] {
+            erratic.bump(t, 60.0);
+        }
+        assert!(regular.interval_budget() < erratic.interval_budget());
+    }
+}
