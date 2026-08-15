@@ -128,6 +128,11 @@ Environment="JULIA_DAEMON_WORKER_MAXCLIENTS=${JULIA_DAEMON_WORKER_MAXCLIENTS:-1}
 Environment="JULIA_DAEMON_WORKER_ARGS=${JULIA_DAEMON_WORKER_ARGS:---startup-file=no}"
 Environment="JULIA_DAEMON_MIN_TTL=${JULIA_DAEMON_MIN_TTL:-120}"
 Environment="JULIA_DAEMON_MAX_TTL=${JULIA_DAEMON_MAX_TTL:-${JULIA_DAEMON_WORKER_TTL:-7200}}"
+# Workers are single-use for interactive sessions (killed on client exit), so
+# the REPL-JIT pre-warm background task never gets a chance to finish before
+# a real client races it — disabled by default; set JULIA_DAEMON_PREWARM=yes
+# to re-enable if worker reuse patterns change.
+Environment="JULIA_DAEMON_PREWARM=${JULIA_DAEMON_PREWARM:-no}"
 Restart=on-failure
 
 [Install]
