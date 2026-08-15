@@ -1,7 +1,5 @@
 // Wire protocol definitions for client ↔ conductor ↔ worker communication.
-use std::io::{self, Read, Write};
-use std::net::TcpStream;
-use std::os::unix::net::UnixStream;
+use std::io::{self};
 
 // --- Magic numbers ---
 
@@ -30,9 +28,12 @@ pub mod worker {
         Sockets     = 0x21,
         QueryState  = 0x30,
         State       = 0x31,
+        QueryClients = 0x32,
+        Clients     = 0x33,
         SoftExit    = 0x40,
         Ack         = 0x41,
         SyncClients = 0x50,
+        DropSession = 0x51,
         Err         = 0xFF,
     }
 
@@ -47,9 +48,12 @@ pub mod worker {
                 0x21 => Self::Sockets,
                 0x30 => Self::QueryState,
                 0x31 => Self::State,
+                0x32 => Self::QueryClients,
+                0x33 => Self::Clients,
                 0x40 => Self::SoftExit,
                 0x41 => Self::Ack,
                 0x50 => Self::SyncClients,
+                0x51 => Self::DropSession,
                 _    => Self::Err,
             }
         }
@@ -73,6 +77,7 @@ pub mod notification {
         WorkerUnresponsive = 0x02,
         WorkerExit         = 0x03,
         ClientExit         = 0x04,
+        ClientInterrupt    = 0x05,
     }
 
     impl Type {
@@ -82,6 +87,7 @@ pub mod notification {
                 0x02 => Some(Self::WorkerUnresponsive),
                 0x03 => Some(Self::WorkerExit),
                 0x04 => Some(Self::ClientExit),
+                0x05 => Some(Self::ClientInterrupt),
                 _    => None,
             }
         }
@@ -93,6 +99,7 @@ pub mod signals {
     pub const RAW_MODE:   u8 = 0x02;
     pub const QUERY_SIZE: u8 = 0x03;
     pub const NODELAY:    u8 = 0x04;
+    pub const EXECUTING:  u8 = 0x05;
 }
 
 // --- Transport mode ---

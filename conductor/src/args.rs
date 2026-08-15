@@ -24,12 +24,19 @@ impl ParsedArgs {
     pub fn has_switch(&self, name: &str) -> bool {
         self.switches.iter().any(|s| s.name == name)
     }
+
+    /// The effective `--threads`/`-t` spec, or `THREADS_NONE` if absent/empty.
+    pub fn thread_switch(&self) -> Threads {
+        parse_threads(self.get_switch("--threads").unwrap_or(""))
+    }
 }
 
 static SHORT_TO_LONG: &[(&str, &str)] = &[
     ("-e", "--eval"),
     ("-E", "--print"),
     ("-L", "--load"),
+    ("-P", "--project"),
+    ("-t", "--threads"),
 ];
 
 static NO_VALUE_SWITCHES: &[&str] = &[
@@ -37,7 +44,62 @@ static NO_VALUE_SWITCHES: &[&str] = &[
     "--restart", "--sync", "--sandbox", "-q", "--quiet",
 ];
 
-static OPTIONAL_VALUE_SWITCHES: &[&str] = &["--session"];
+// Switches whose value may only be given as --switch=value; a following
+// argument is the program file, as in `julia --project script.jl`.
+static OPTIONAL_VALUE_SWITCHES: &[&str] = &[
+    "--session",
+    "--status",
+    "--project",
+    "--code-coverage",
+    "--track-allocation",
+    "--debug-info",
+];
+
+/// A Julia `--threads` spec as (default pool, interactive pool) counts.
+///
+/// Julia fixes thread counts at process startup, so this becomes part of a
+/// worker's identity: a client can only reuse a worker spawned with the same
+/// spec. Sentinels per field: `0` = unset (Julia default), `0xffff` = `auto`.
+pub type Threads = [u16; 2];
+pub const THREADS_UNSET: u16 = 0;
+pub const THREADS_AUTO: u16 = 0xffff;
+pub const THREADS_NONE: Threads = [THREADS_UNSET, THREADS_UNSET];
+
+/// A single comparable value identifying a spec, for embedding in pool keys.
+pub fn pack_threads(spec: Threads) -> u32 {
+    ((spec[0] as u32) << 16) | spec[1] as u32
+}
+
+/// Parse a `--threads` value (`N`, `auto`, `N,M`, `auto,M`). Unrecognised
+/// fields fall back to `auto`, leaving the final verdict to Julia at startup.
+pub fn parse_threads(value: &str) -> Threads {
+    if value.is_empty() { return THREADS_NONE; }
+    let mut parts = value.splitn(2, ',');
+    let default = parts.next().unwrap_or("");
+    let interactive = parts.next().unwrap_or("");
+    [parse_thread_field(default), parse_thread_field(interactive)]
+}
+
+fn parse_thread_field(field: &str) -> u16 {
+    if field.is_empty() { return THREADS_UNSET; }
+    if field == "auto" { return THREADS_AUTO; }
+    field.parse().unwrap_or(THREADS_AUTO)
+}
+
+/// Render a spec as a `--threads` value (`3`, `auto`, `4,1`), or `None` when unset.
+pub fn render_threads(spec: Threads) -> Option<String> {
+    if spec[0] == THREADS_UNSET && spec[1] == THREADS_UNSET { return None; }
+    let default = thread_field(spec[0]);
+    Some(if spec[1] == THREADS_UNSET {
+        default
+    } else {
+        format!("{},{}", default, thread_field(spec[1]))
+    })
+}
+
+fn thread_field(val: u16) -> String {
+    if val == THREADS_AUTO || val == THREADS_UNSET { "auto".to_string() } else { val.to_string() }
+}
 
 pub fn parse(args: &[String]) -> ParsedArgs {
     let mut switches = Vec::new();

@@ -41,6 +41,7 @@ pub struct SandboxConfig {
     pub julia_channel: Option<String>,
     pub worker_project: String,
     pub worker_args: String,
+    pub threads_arg: Option<String>, // rendered "--threads=N,M" value, if any
     pub eval_expr: String,
     pub host_environ: HashMap<String, String>,
     pub setup_socket_path: String,
@@ -433,6 +434,7 @@ fn build_argv(cfg: &SandboxConfig) -> Result<Vec<Vec<u8>>, SandboxError> {
         push(&mut argv, &format!("--project={}", cfg.worker_project));
     }
     for arg in cfg.worker_args.split_whitespace() { push(&mut argv, arg); }
+    if let Some(t) = &cfg.threads_arg { push(&mut argv, &format!("--threads={}", t)); }
     push(&mut argv, "--eval");
     push(&mut argv, &cfg.eval_expr);
     Ok(argv)

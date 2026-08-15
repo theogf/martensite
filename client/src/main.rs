@@ -11,11 +11,13 @@ mod protocol {
     pub const ENV_REQUEST: u8  = 0x3F;
     pub const NOTIFICATION_MAGIC: u32 = 0x4A444E01;
     pub const NOTIFICATION_CLIENT_EXIT: u8 = 0x04;
+    pub const NOTIFICATION_CLIENT_INTERRUPT: u8 = 0x05;
     pub const DEFAULT_TCP_PORT: u16 = 9345;
     pub const SIG_EXIT: u8     = 0x01;
     pub const SIG_RAW_MODE: u8 = 0x02;
     pub const SIG_QUERY_SIZE: u8 = 0x03;
     pub const SIG_NODELAY: u8  = 0x04;
+    pub const SIG_EXECUTING: u8 = 0x05;
 }
 
 const MAX_SOCKET_PATH: usize = 256;
@@ -94,14 +96,25 @@ fn set_raw_mode(raw: bool) {
     }
 }
 
+// Exit restoring cooked mode first; std::process::exit alone would otherwise
+// leave the terminal raw if called from an error path entered after raw mode
+// was set. No-op unless raw mode was entered.
+fn exit_client(code: i32) -> ! {
+    set_raw_mode(false);
+    std::process::exit(code);
+}
+
 fn is_tty(fd: i32) -> bool {
     unsafe { libc::isatty(fd) != 0 }
 }
 
+// A degenerate winsize (ioctl succeeds but reports 0 rows/cols — a pty with no
+// size set, or a terminal mid-teardown) is as useless as no tty: the worker's
+// REPL divides by the column count, so a 0 must never go on the wire.
 fn terminal_size(fd: i32) -> Option<(u16, u16)> {
     unsafe {
         let mut ws: libc::winsize = std::mem::zeroed();
-        if libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) == 0 {
+        if libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_row != 0 && ws.ws_col != 0 {
             Some((ws.ws_row, ws.ws_col))
         } else {
             None
@@ -119,7 +132,7 @@ fn parse_address(raw: &str) -> (bool, String) {
     if raw.contains("://") {
         eprintln!("Unsupported address scheme: {}", raw);
         eprintln!("Only tcp:// and unix paths are supported.");
-        std::process::exit(1);
+        exit_client(1);
     }
     if !raw.starts_with('/') && !raw.starts_with('.') && !raw.contains('/') {
         return (true, raw.to_string());
@@ -316,7 +329,7 @@ fn connect_to_conductor(env: &EnvInfo, addr_override: Option<&str>) -> Conductor
     eprintln!("  pkill -f julia-conductor && julia-conductor &");
     eprintln!();
     eprintln!("Or specify a different address with -a <addr>");
-    std::process::exit(127);
+    exit_client(127);
 }
 
 // --- Send client info ---
@@ -430,7 +443,7 @@ fn receive_worker_sockets(
     let mut first_byte = [0u8; 1];
     if !read_exact_fd(conductor_fd, &mut first_byte) {
         eprintln!("Failed to read from conductor");
-        std::process::exit(127);
+        exit_client(127);
     }
 
     if first_byte[0] == protocol::ENV_REQUEST {
@@ -471,7 +484,7 @@ fn receive_worker_sockets(
     let connect = |path: &str, label: &str| -> RawFd {
         connect_to_worker_socket(path, is_tcp, &conductor_host).unwrap_or_else(|| {
             eprintln!("Failed to connect to {} socket at '{}'", label, path);
-            std::process::exit(127);
+            exit_client(127);
         })
     };
 
@@ -511,9 +524,9 @@ impl SignalParser {
             let data_len = self.buf[pos + 1] as usize;
             if pos + 2 + data_len > self.buf.len() { break; }
             let data = self.buf[pos + 2..pos + 2 + data_len].to_vec();
-            if let Some(code) = self.dispatch(id, &data, signals_fd) {
-                result = Some(code);
-            }
+            let signal = self.dispatch(id, &data, signals_fd);
+            // exit is terminal; later signals in the same batch can't unset it.
+            if result.is_none() { result = signal; }
             pos += 2 + data_len;
         }
         self.buf.drain(..pos);
@@ -526,6 +539,7 @@ impl SignalParser {
             protocol::SIG_RAW_MODE => {
                 if data.len() >= 1 {
                     let want_raw = data[0] != 0;
+                    WORKER_RAW.store(want_raw, std::sync::atomic::Ordering::SeqCst);
                     if self.sync_mode {
                         self.worker_wants_raw = want_raw;
                     } else {
@@ -549,6 +563,14 @@ impl SignalParser {
             protocol::SIG_NODELAY => {
                 // Signal socket already has nodelay set; apply to stdin socket too
                 // (we'd need the stdin fd here — skip for now)
+                None
+            }
+            protocol::SIG_EXECUTING => {
+                // Unacknowledged: the worker does not read a reply, and a stray one
+                // would be consumed by the next raw_mode ack.
+                if !data.is_empty() {
+                    WORKER_EXECUTING.store(data[0] != 0, std::sync::atomic::Ordering::Relaxed);
+                }
                 None
             }
             _ => None,
@@ -583,11 +605,45 @@ static CONDUCTOR_ADDR_BUF: std::sync::Mutex<String> = std::sync::Mutex::new(Stri
 // Worker stdin fd for forwarding SIGINT as Ctrl-C
 static WORKER_STDIN_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
+// Worker's last-reported prompt/evaluating state, set from the `executing`
+// signal; gates how SIGINT is delivered (see handle_sigint).
+static WORKER_EXECUTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+// Whether the terminal is currently in raw mode at the worker's request
+// (i.e. an interactive REPL is attached and reading stdin directly).
+static WORKER_RAW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Notify the conductor that this client wants its worker interrupted.
+/// Best-effort: connects fresh, sends, closes. Silent on any failure.
+fn notify_interrupt(is_tcp: bool, conductor_addr: &str) {
+    let fd = if is_tcp { connect_tcp(conductor_addr) } else { connect_unix(conductor_addr) };
+    if let Some(fd) = fd {
+        let pid = unsafe { libc::getpid() as u32 };
+        let mut buf = [0u8; 9];
+        buf[..4].copy_from_slice(&protocol::NOTIFICATION_MAGIC.to_le_bytes());
+        buf[4] = protocol::NOTIFICATION_CLIENT_INTERRUPT;
+        buf[5..9].copy_from_slice(&pid.to_le_bytes());
+        write_fd(fd, &buf);
+        unsafe { libc::close(fd); }
+    }
+}
+
 fn install_client_signal_handlers() {
     extern "C" fn handle_sigint(_: libc::c_int) {
-        let fd = WORKER_STDIN_FD.load(std::sync::atomic::Ordering::SeqCst);
-        if fd >= 0 {
-            write_fd(fd, b"\x03");
+        let raw = WORKER_RAW.load(std::sync::atomic::Ordering::SeqCst);
+        let executing = WORKER_EXECUTING.load(std::sync::atomic::Ordering::SeqCst);
+        if raw && !executing {
+            // At the prompt: LineEdit reads ^C directly off stdin.
+            let fd = WORKER_STDIN_FD.load(std::sync::atomic::Ordering::SeqCst);
+            if fd >= 0 {
+                write_fd(fd, b"\x03");
+            }
+        } else {
+            // Mid-eval (or not yet raw): ^C on stdin wouldn't reach the running
+            // task, so ask the conductor to interrupt the worker process directly.
+            // Never coalesced — repeated Ctrl-C must accumulate for Julia's force-throw.
+            let is_tcp = CONDUCTOR_IS_TCP.load(std::sync::atomic::Ordering::SeqCst);
+            let addr = CONDUCTOR_ADDR_BUF.lock().unwrap().clone();
+            notify_interrupt(is_tcp, &addr);
         }
     }
 
@@ -601,10 +657,10 @@ fn install_client_signal_handlers() {
 
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = handle_sigint as libc::sighandler_t;
+        sa.sa_sigaction = handle_sigint as *const () as libc::sighandler_t;
         libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
 
-        sa.sa_sigaction = handle_sigterm as libc::sighandler_t;
+        sa.sa_sigaction = handle_sigterm as *const () as libc::sighandler_t;
         libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
 
         // Ignore SIGPIPE
@@ -777,6 +833,5 @@ fn main() {
     // Notify conductor we're done
     notify_exit(is_tcp, &conductor_addr);
 
-    set_raw_mode(false);
-    std::process::exit(exit_code as i32);
+    exit_client(exit_code as i32);
 }

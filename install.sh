@@ -17,7 +17,6 @@ XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 XDG_BIN_HOME="$HOME/.local/bin"
 
 INSTALL_DIR="$XDG_DATA_HOME/julia-daemon"
-WORKER_PROJECT_DST="$INSTALL_DIR/worker"
 CONDUCTOR_DST="$INSTALL_DIR/julia-conductor"
 CLIENT_DST="$INSTALL_DIR/juliaclient"
 CLIENT_SYMLINK="$XDG_BIN_HOME/juliaclient"
@@ -28,9 +27,6 @@ TEMPER_SCRIPT_DST="$XDG_BIN_HOME/temper"
 
 SERVICE_NAME="julia-daemon"
 SERVICE_FILE="$XDG_CONFIG_HOME/systemd/user/$SERVICE_NAME.service"
-
-# Source of the DaemonWorker Julia project — adjust if your DaemonicCabal checkout differs
-WORKER_PROJECT_SRC="${JULIA_DAEMONICABAL_DIR:-$HOME/.julia/dev/DaemonicCabal}/worker"
 
 # --- Uninstall ---
 
@@ -90,15 +86,10 @@ chmod -R u+w "$INSTALL_DIR" 2>/dev/null || true
 rm -rf "$INSTALL_DIR"
 mkdir -p "$INSTALL_DIR"
 
-# Worker project (read-only copy)
-if [[ -d "$WORKER_PROJECT_SRC" ]]; then
-    cp -r "$WORKER_PROJECT_SRC" "$WORKER_PROJECT_DST"
-    chmod -R a-w "$WORKER_PROJECT_DST"
-else
-    echo "WARNING: Worker project not found at $WORKER_PROJECT_SRC"
-    echo "  Set JULIA_DAEMONICABAL_DIR to your DaemonicCabal checkout."
-    echo "  You must set JULIA_DAEMON_WORKER_PROJECT manually in the service."
-fi
+# Julia @daemonic environment
+echo "Setting up @daemonic Julia environment..."
+"${JULIA_DAEMON_WORKER_EXECUTABLE:-julia}" -e \
+    'import Pkg; Pkg.activate("@daemonic", shared=true); Pkg.add("DaemonicCabal")'
 
 cp "$CONDUCTOR_BIN" "$CONDUCTOR_DST"
 cp "$CLIENT_BIN"    "$CLIENT_DST"
@@ -107,7 +98,7 @@ chmod 755 "$CONDUCTOR_DST" "$CLIENT_DST"
 # --- Systemd service ---
 
 JULIA_BIN="${JULIA_DAEMON_WORKER_EXECUTABLE:-$(command -v julia || echo julia)}"
-WORKER_PROJECT="${JULIA_DAEMON_WORKER_PROJECT:-$WORKER_PROJECT_DST}"
+WORKER_PROJECT="${JULIA_DAEMON_WORKER_PROJECT:-@daemonic}"
 
 mkdir -p "$(dirname "$SERVICE_FILE")"
 
@@ -122,7 +113,8 @@ Environment="JULIA_DAEMON_WORKER_EXECUTABLE=$JULIA_BIN"
 Environment="JULIA_DAEMON_WORKER_PROJECT=$WORKER_PROJECT"
 Environment="JULIA_DAEMON_WORKER_MAXCLIENTS=${JULIA_DAEMON_WORKER_MAXCLIENTS:-1}"
 Environment="JULIA_DAEMON_WORKER_ARGS=${JULIA_DAEMON_WORKER_ARGS:---startup-file=no}"
-Environment="JULIA_DAEMON_WORKER_TTL=${JULIA_DAEMON_WORKER_TTL:-7200}"
+Environment="JULIA_DAEMON_MIN_TTL=${JULIA_DAEMON_MIN_TTL:-120}"
+Environment="JULIA_DAEMON_MAX_TTL=${JULIA_DAEMON_MAX_TTL:-${JULIA_DAEMON_WORKER_TTL:-7200}}"
 Restart=on-failure
 
 [Install]

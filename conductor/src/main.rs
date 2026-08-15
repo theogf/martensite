@@ -5,8 +5,10 @@ mod args;
 mod config;
 mod conductor;
 mod env_cache;
+mod pressure;
 mod project;
 mod protocol;
+mod status;
 mod worker;
 #[cfg(target_os = "linux")]
 mod sandbox;
@@ -27,7 +29,8 @@ fn main() {
     eprintln!(" - Worker executable: {}", config.worker_executable);
     eprintln!(" - Worker args: {}", config.worker_args);
     eprintln!(" - Max clients per worker: {}", config.worker_maxclients);
-    eprintln!(" - Worker TTL: {} seconds", config.worker_ttl);
+    eprintln!(" - Worker TTL: min {} / max {} seconds", config.min_ttl, config.max_ttl);
+    if config.memory_pressure { eprintln!(" - Memory pressure eviction: enabled"); }
     eprintln!(" - Transport: {}", if config.transport == protocol::TransportMode::Unix { "unix" } else { "tcp" });
     eprintln!(" - Address: {}", config.socket_path);
     if let Some((base, count)) = config.port_range {
@@ -81,8 +84,11 @@ fn main() {
 
     // Wrap conductor in Arc<Mutex> for potential future multi-threaded use
     let conductor = Arc::new(Mutex::new(conductor));
+    // Let the conductor spawn its own background threads (e.g. --status=live
+    // redraw loops) without main.rs threading an Arc through every call site.
+    conductor.lock().unwrap().self_ref = Some(Arc::downgrade(&conductor));
 
-    // Spawn health check timer thread
+    // Spawn health check / idle-cull timer thread (ping_timer)
     {
         let conductor_clone = Arc::clone(&conductor);
         let ping_interval = conductor.lock().unwrap().config.ping_interval;
@@ -91,6 +97,29 @@ fn main() {
                 std::thread::sleep(Duration::from_secs(ping_interval));
                 if let Ok(mut c) = conductor_clone.lock() {
                     c.check_workers();
+                    c.enforce_max_ttl();
+                    // When pressure eviction is inactive, this timer alone is
+                    // responsible for advancing staged retirements; otherwise
+                    // the more-frequent pressure_timer below does it.
+                    if !c.pressure.active() {
+                        c.sweep_pending_kills();
+                    }
+                }
+            }
+        });
+    }
+
+    // Spawn memory-pressure timer thread (pressure_timer), only if a
+    // pressure source (PSI or free-memory) was actually detected.
+    if conductor.lock().unwrap().pressure.active() {
+        let conductor_clone = Arc::clone(&conductor);
+        let interval = conductor.lock().unwrap().config.ping_interval.min(5).max(1);
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_secs(interval));
+                if let Ok(mut c) = conductor_clone.lock() {
+                    c.sweep_pending_kills();
+                    c.run_eviction_episode();
                 }
             }
         });
@@ -209,11 +238,11 @@ fn install_signal_handlers(sig_w: i32) {
 
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = handle_shutdown as libc::sighandler_t;
+        sa.sa_sigaction = handle_shutdown as *const () as libc::sighandler_t;
         libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
         libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
 
-        sa.sa_sigaction = handle_usr1 as libc::sighandler_t;
+        sa.sa_sigaction = handle_usr1 as *const () as libc::sighandler_t;
         libc::sigaction(libc::SIGUSR1, &sa, std::ptr::null_mut());
 
         // Ignore SIGPIPE

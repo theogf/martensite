@@ -33,18 +33,24 @@ Wire format is identical to the Zig implementation:
 - `NOTIFICATION_MAGIC = 0x4A444E01` ("JDN\x01")
 - All integers little-endian, strings length-prefixed with u16
 
-The Rust binaries are fully compatible with DaemonicCabal's Julia worker (`DaemonWorker.jl`).
+The Rust binaries track DaemonicCabal.jl 0.5.0's wire protocol, including the additions from that release: `query_clients`/`clients`/`drop_session` worker messages, the `client_interrupt` notification, and the `executing` signal.
 
 ### Key env vars (conductor)
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `JULIA_DAEMON_WORKER_PROJECT` | *(required)* | Path to DaemonWorker project |
+| `JULIA_DAEMON_WORKER_PROJECT` | `@daemonic` | Julia project/environment for workers |
 | `JULIA_DAEMON_SERVER` | `<runtime_dir>/conductor.sock` | Socket path or `tcp://host:port` |
 | `JULIA_DAEMON_RUNTIME` | `/run/user/$UID/julia-daemon` | Runtime directory |
 | `JULIA_DAEMON_WORKER_EXECUTABLE` | `julia` | Julia binary |
 | `JULIA_DAEMON_WORKER_MAXCLIENTS` | `1` | Max clients per worker |
-| `JULIA_DAEMON_WORKER_TTL` | `7200` | Worker idle timeout (seconds) |
+| `JULIA_DAEMON_MIN_TTL` | `120` | Idle floor (seconds): a worker younger than this is never pressure-evicted |
+| `JULIA_DAEMON_MAX_TTL` | `7200` | Idle ceiling (seconds): always culled once idle past this, pressure or not. Supersedes the old `JULIA_DAEMON_WORKER_TTL`, which is still read as its fallback default |
+| `JULIA_DAEMON_MEMORY_PRESSURE` | `1` | Master switch for pressure-reactive eviction; `0` disables it (flat MIN/MAX_TTL culling still applies) |
+| `JULIA_DAEMON_PSI_THRESHOLD` | `10.0` | PSI `some avg10` percent that counts as pressure, when `/proc/pressure/memory` is available |
+| `JULIA_DAEMON_MEMFREE_LOW` / `_HIGH` | `10%` / `15%` | Free-memory enter/exit thresholds (fraction of total, or bytes with a `K`/`M`/`G` suffix), used as a fallback when PSI isn't available |
+
+The actual idle budget a given worker gets is adaptive, not a flat MIN/MAX_TTL cutoff — see `idle_budget` in `conductor/src/conductor.rs` and the recency/frequency + occupancy tracking in `conductor/src/worker.rs` (`Crf`, `Ewma`).
 
 ### Installation
 
@@ -53,20 +59,19 @@ The Rust binaries are fully compatible with DaemonicCabal's Julia worker (`Daemo
 ./install.sh uninstall  # remove everything
 ```
 
-What it does (mirroring `DaemonicCabal.install()`):
+What it does:
 1. `cargo build --release`
-2. Copies binaries + worker project to `~/.local/share/julia-daemon/`
-3. Writes `~/.config/systemd/user/julia-daemon.service` and enables it
-4. Symlinks `juliaclient` → `~/.local/bin/juliaclient`
-5. Copies `quench.sh` → `~/.local/bin/quench`
-
-Set `JULIA_DAEMONICABAL_DIR` if your DaemonicCabal checkout is not at `~/.julia/dev/DaemonicCabal`.
+2. Creates a `@daemonic` Julia environment via `Pkg.add("DaemonicCabal")`
+3. Copies binaries to `~/.local/share/julia-daemon/`
+4. Writes `~/.config/systemd/user/julia-daemon.service` (with `JULIA_DAEMON_WORKER_PROJECT=@daemonic`) and enables it
+5. Symlinks `juliaclient` → `~/.local/bin/juliaclient`
+6. Copies `quench.sh` → `~/.local/bin/quench`
 
 ### DaemonicCabal patches
 
-The following bug fixes have been applied to `~/.julia/dev/DaemonicCabal/worker/src/setup.jl` and must be re-applied after any upstream update:
+As of DaemonicCabal.jl 0.5.0, the previously-required local patch is upstream and no longer needs manual reapplication:
 
-**`dup: Bad file descriptor` on REPL exit** — on Julia < 1.11, `redirect_stdio` cleanup calls `dup` on a file descriptor that is already closed when the client disconnects. Fix: catch the specific `SystemError` in the spawned client task:
+**`dup: Bad file descriptor` on REPL exit** — on Julia < 1.11, `redirect_stdio` cleanup calls `dup` on a file descriptor that is already closed when the client disconnects. Upstream now carries the guard itself (`worker/src/setup.jl`, inside the `teardown_client` cleanup):
 
 ```julia
 catch err
@@ -75,9 +80,14 @@ catch err
 end
 ```
 
+If `~/.julia/dev/DaemonicCabal` still has an uncommitted local copy of this patch from before the 0.5.0 upgrade, it's safe to drop — just confirm the checkout is actually on 0.5.0+ first.
+
 ### Design notes
 
 - **No async runtime** — synchronous I/O matches the Zig single-threaded model and keeps `fork()` safe for sandbox spawning.
-- **Conductor** uses a `select()`-based accept loop with a background thread for periodic ping health checks.
-- **Client** uses `epoll` (Linux) or `poll` (fallback) to multiplex stdin/stdout/stderr/signals.
+- **Conductor** uses a `select()`-based accept loop, with background threads for periodic ping health checks, min/max-TTL idle culling, and (when a pressure source is detected) memory-pressure eviction. Worker teardown is staged (`soft_exit` → grace → `SIGTERM` → grace → `SIGKILL`), tracked in a pending-kill list swept by those same timers rather than killed in place.
+- **Idle budget** is adaptive per worker, not a flat TTL: a recency/frequency score per pool key (`Crf`, an LRFU-style value plus a Jacobson/RFC6298 inter-summon interval estimate) combines with a decayed busy-fraction estimate per worker (`Ewma`) to size how long it's worth keeping a given worker around — see `Conductor::idle_budget`.
+- **`--threads`/`-t` is part of a worker's pool identity** — Julia fixes thread counts at process startup, so a worker spawned with a different `--threads` spec can't be reused for a request wanting a different one (same treatment as a project or Julia-channel mismatch).
+- **`--status`/`--status=live`** renders a tree of workers/clients/pressure state from the conductor's own in-memory data (no worker-protocol round trip). Live mode redraws in place from a background thread that re-locks the conductor briefly per frame, so it never blocks the main accept loop; teardown is notification-driven (`client_exit`/`client_interrupt`), not a bespoke keypress handler. Unlike upstream, this port renders with flat ANSI colors rather than an OSC-probed truecolor palette — a deliberate scope cut, not a compatibility gap.
+- **Client** uses `epoll` (Linux) or `poll` (fallback) to multiplex stdin/stdout/stderr/signals. `Ctrl-C` is delivered as a literal `\x03` on stdin when the worker is at a raw prompt, or as a `client_interrupt` notification (conductor sends the worker process `SIGINT` directly) when mid-eval — gated by the worker's `executing` signal.
 - **Sandbox** (Linux only) uses unprivileged user namespaces (`unshare`/`pivot_root`/bind mounts) via raw `libc` syscalls — no root required.

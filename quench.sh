@@ -14,4 +14,4 @@ else
     session=$(pwd)
 fi
 
-exec juliaclient --session="$session" -i
+exec juliaclient --session="$session" -i "$@"

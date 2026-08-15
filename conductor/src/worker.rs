@@ -4,12 +4,127 @@ use std::os::unix::io::AsRawFd;
 use std::time::Duration;
 use std::process::{Child, Command, Stdio};
 
-use crate::args::Switch;
+use crate::args::{Switch, Threads};
 use crate::config::Config;
 use crate::env_cache::EnvVar;
 use crate::protocol::{self, worker as proto_worker};
 
 const MAX_RECENT_PPIDS: usize = 32;
+
+// --- Occupancy: EWMA of busy-fraction (attached-client time / wall time) ---
+//
+// Two independent instances per worker: `fast` (short half-life) drives
+// pressure-eviction ranking and --status display; `slow` (long half-life)
+// drives the idle-budget calculation. Both are frozen (not decayed further)
+// once a worker goes idle — see Worker::idle_budget, which reads `slow` as of
+// `last_active` rather than "now".
+#[derive(Clone, Copy, Debug)]
+pub struct Ewma {
+    value: f64,
+    last_t: i64,
+    busy_since: Option<i64>,
+}
+
+impl Ewma {
+    fn new(now: i64) -> Self {
+        Ewma { value: 0.0, last_t: now, busy_since: None }
+    }
+
+    fn update_to(&mut self, now: i64, half_life: f64) {
+        let dt = (now - self.last_t) as f64;
+        if dt <= 0.0 { return; }
+        let busy_frac = if self.busy_since.is_some() { 1.0 } else { 0.0 };
+        let decay = if half_life > 0.0 { 2f64.powf(-dt / half_life) } else { 0.0 };
+        self.value = self.value * decay + busy_frac * (1.0 - decay);
+        self.last_t = now;
+    }
+
+    pub fn attach(&mut self, now: i64, half_life: f64) {
+        self.update_to(now, half_life);
+        self.busy_since = Some(now);
+    }
+
+    pub fn detach(&mut self, now: i64, half_life: f64) {
+        self.update_to(now, half_life);
+        self.busy_since = None;
+    }
+
+    /// Decayed value as of `now`.
+    pub fn read(&mut self, now: i64, half_life: f64) -> f64 {
+        self.update_to(now, half_life);
+        self.value
+    }
+
+    /// Decayed value as of `now`, without mutating stored state. `now` is
+    /// normally <= the last update time (e.g. reading a detached worker's
+    /// occupancy as of when it went idle), in which case this is just the
+    /// frozen value — occupancy intentionally isn't decayed further purely
+    /// by the passage of idle time.
+    pub fn peek(&self, now: i64, half_life: f64) -> f64 {
+        let dt = (now - self.last_t) as f64;
+        if dt <= 0.0 { return self.value; }
+        let busy_frac = if self.busy_since.is_some() { 1.0 } else { 0.0 };
+        let decay = if half_life > 0.0 { 2f64.powf(-dt / half_life) } else { 0.0 };
+        self.value * decay + busy_frac * (1.0 - decay)
+    }
+}
+
+// --- Crf: recency-frequency score + Jacobson/RFC6298 inter-summon interval estimator ---
+//
+// Tracked per worker *pool key* (not per worker instance — a key can outlive
+// any individual worker as workers are recycled). `value` is an LRFU-style
+// score that grows on each summon and decays between them; `srtt`/`rttvar`
+// estimate the typical gap between summons (like TCP's RTO), giving an
+// adaptive idle budget: keys summoned often/regularly get long budgets, cold
+// keys decay quickly.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Crf {
+    value: f64,
+    srtt: f64,
+    rttvar: f64,
+    last_summon: Option<i64>,
+    summons: u32,
+}
+
+impl Crf {
+    pub fn bump(&mut self, now: i64, half_life: f64) {
+        if let Some(last) = self.last_summon {
+            let gap = (now - last) as f64;
+            let decay = if half_life > 0.0 { 2f64.powf(-gap / half_life) } else { 0.0 };
+            self.value = 1.0 + self.value * decay;
+            if self.summons == 1 {
+                self.srtt = gap;
+                self.rttvar = gap / 2.0;
+            } else if self.summons > 1 {
+                let err = gap - self.srtt;
+                self.srtt += err / 8.0;
+                self.rttvar += (err.abs() - self.rttvar) / 4.0;
+            }
+        } else {
+            self.value = 1.0;
+        }
+        self.last_summon = Some(now);
+        self.summons += 1;
+    }
+
+    /// Decayed value as of `now`, without mutating stored state.
+    pub fn read(&self, now: i64, half_life: f64) -> f64 {
+        match self.last_summon {
+            None => 0.0,
+            Some(last) => {
+                let gap = (now - last) as f64;
+                let decay = if half_life > 0.0 { 2f64.powf(-gap / half_life) } else { 0.0 };
+                self.value * decay
+            }
+        }
+    }
+
+    /// RFC6298-style RTO estimate of the typical inter-summon gap.
+    pub fn interval_budget(&self) -> f64 {
+        if self.summons < 2 { return 0.0; }
+        self.srtt + 4.0 * self.rttvar
+    }
+}
 
 // --- Process handle: either a Command-spawned child or a raw fork()ed PID ---
 
@@ -72,6 +187,7 @@ pub struct Worker {
     pub socket: UnixStream,
     pub project: Option<String>,
     pub julia_channel: Option<String>,
+    pub threads: Threads,
     pub session_label: Option<String>,
     pub created_at: i64,
     pub last_active: i64,
@@ -82,6 +198,23 @@ pub struct Worker {
     pub interactive: bool,
     pub recent_ppids: [u32; MAX_RECENT_PPIDS],
     pub recent_ppids_next: usize,
+    // --- pressure/status sampling (see refresh_stats) ---
+    pub occ_fast: Ewma,
+    pub occ_slow: Ewma,
+    pub mem_bytes: u64,
+    pub cpu_pct: f64,
+    cpu_last_ticks: u64,
+    cpu_last_sample_at: i64, // microseconds
+    // --- staged retirement (soft_exit -> grace -> SIGTERM -> grace -> SIGKILL) ---
+    pub retire_stage: RetireStage,
+    pub retire_since: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RetireStage {
+    Running,
+    Soft,
+    Term,
 }
 
 impl Worker {
@@ -91,8 +224,9 @@ impl Worker {
         runtime_dir: &str,
         julia_channel: Option<&str>,
         interactive: bool,
+        threads: Threads,
     ) -> io::Result<Self> {
-        Self::spawn_impl(cfg, id, runtime_dir, julia_channel, interactive, false, None, &[], &[])
+        Self::spawn_impl(cfg, id, runtime_dir, julia_channel, interactive, threads, false, None, &[], &[])
     }
 
     #[cfg(target_os = "linux")]
@@ -101,11 +235,12 @@ impl Worker {
         id: u32,
         runtime_dir: &str,
         julia_channel: Option<&str>,
+        threads: Threads,
         environ: &std::collections::HashMap<String, String>,
         extra_ro: &[String],
         extra_rw: &[String],
     ) -> io::Result<Self> {
-        Self::spawn_impl(cfg, id, runtime_dir, julia_channel, false, true,
+        Self::spawn_impl(cfg, id, runtime_dir, julia_channel, false, threads, true,
             Some(environ), extra_ro, extra_rw)
     }
 
@@ -115,6 +250,7 @@ impl Worker {
         runtime_dir: &str,
         julia_channel: Option<&str>,
         interactive: bool,
+        threads: Threads,
         sandboxed: bool,
         _environ: Option<&std::collections::HashMap<String, String>>,
         _extra_ro: &[String],
@@ -159,6 +295,7 @@ impl Worker {
                     julia_channel: julia_channel.map(|s| s.to_string()),
                     worker_project: cfg.worker_project.clone(),
                     worker_args: cfg.worker_args.clone(),
+                    threads_arg: crate::args::render_threads(threads),
                     eval_expr: eval_expr.clone(),
                     host_environ: _environ.cloned().unwrap_or_default(),
                     setup_socket_path: setup_path.clone(),
@@ -186,6 +323,9 @@ impl Worker {
             }
             for arg in cfg.worker_args.split_whitespace() {
                 argv.push(arg.to_string());
+            }
+            if let Some(t) = crate::args::render_threads(threads) {
+                argv.push(format!("--threads={}", t));
             }
             if interactive { argv.push("-i".to_string()); }
             argv.push("--eval".to_string());
@@ -224,6 +364,7 @@ impl Worker {
             socket: worker_stream,
             project: None,
             julia_channel: julia_channel.map(|s| s.to_string()),
+            threads,
             session_label: None,
             created_at: now,
             last_active: now,
@@ -234,6 +375,14 @@ impl Worker {
             interactive,
             recent_ppids: [0; MAX_RECENT_PPIDS],
             recent_ppids_next: 0,
+            occ_fast: Ewma::new(now),
+            occ_slow: Ewma::new(now),
+            mem_bytes: 0,
+            cpu_pct: 0.0,
+            cpu_last_ticks: 0,
+            cpu_last_sample_at: 0,
+            retire_stage: RetireStage::Running,
+            retire_since: 0,
         })
     }
 
@@ -290,6 +439,59 @@ impl Worker {
         }
         self.project = Some(project);
         Ok(())
+    }
+
+    /// Tell the worker to tear down a named session's REPL/Main-module state
+    /// (its label's `--session` scope), typically right before the label is
+    /// reassigned to a different client. Fire-and-forget: no response is read.
+    pub fn drop_session(&self, label: &str) -> io::Result<()> {
+        let payload_len = 2 + label.len() as u16;
+        self.write_header(proto_worker::MessageType::DropSession, payload_len)?;
+        write_all(&self.socket, &(label.len() as u16).to_le_bytes())?;
+        write_all(&self.socket, label.as_bytes())
+    }
+
+    /// Ask the worker for its live client PID list (used to reconcile
+    /// `active_clients` after a lost `client_done` notification — a stronger
+    /// repair than the count-only `sync_clients` push).
+    pub fn query_clients(&self) -> io::Result<Vec<u32>> {
+        self.write_header(proto_worker::MessageType::QueryClients, 0)?;
+        let (msg, _) = self.read_header()?;
+        if msg != proto_worker::MessageType::Clients {
+            return Err(io::Error::new(io::ErrorKind::Other, "expected clients response"));
+        }
+        let mut count_buf = [0u8; 2];
+        read_exact(&self.socket, &mut count_buf)?;
+        let count = u16::from_le_bytes(count_buf) as usize;
+        let mut pids = Vec::with_capacity(count);
+        for _ in 0..count {
+            let mut buf = [0u8; 4];
+            read_exact(&self.socket, &mut buf)?;
+            pids.push(u32::from_le_bytes(buf));
+        }
+        Ok(pids)
+    }
+
+    /// Sample RSS (from /proc/[pid]/statm) and CPU% (from /proc/[pid]/stat,
+    /// as a delta over the last sample) for the worker process. Best-effort:
+    /// leaves prior values in place if /proc is unreadable (e.g. process
+    /// just exited, or a sandboxed worker whose PID lives in another
+    /// namespace and isn't visible under our /proc).
+    pub fn refresh_stats(&mut self, now_us: i64) {
+        let pid = self.process.pid();
+        if let Some(rss) = read_rss_bytes(pid) {
+            self.mem_bytes = rss;
+        }
+        if let Some(ticks) = read_cpu_ticks(pid) {
+            if self.cpu_last_sample_at > 0 {
+                let dt_us = (now_us - self.cpu_last_sample_at).max(1) as f64;
+                let dt_ticks = ticks.saturating_sub(self.cpu_last_ticks) as f64;
+                let hz = clock_ticks_per_sec() as f64;
+                self.cpu_pct = (dt_ticks / hz) / (dt_us / 1_000_000.0) * 100.0;
+            }
+            self.cpu_last_ticks = ticks;
+            self.cpu_last_sample_at = now_us;
+        }
     }
 
     pub fn soft_exit(&self) {
@@ -472,6 +674,38 @@ pub fn unix_time() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+pub fn unix_time_us() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0)
+}
+
+fn clock_ticks_per_sec() -> i64 {
+    unsafe { libc::sysconf(libc::_SC_CLK_TCK) }
+}
+
+/// RSS in bytes from /proc/[pid]/statm (field 2, in pages).
+fn read_rss_bytes(pid: u32) -> Option<u64> {
+    let content = std::fs::read_to_string(format!("/proc/{}/statm", pid)).ok()?;
+    let rss_pages: u64 = content.split_whitespace().nth(1)?.parse().ok()?;
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+    Some(rss_pages * page_size)
+}
+
+/// Total CPU ticks (utime+stime, fields 14+15) from /proc/[pid]/stat.
+/// The comm field can contain spaces/parens, so we split on the last ')'.
+fn read_cpu_ticks(pid: u32) -> Option<u64> {
+    let content = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
+    let after_comm = content.rsplit_once(')')?.1;
+    let fields: Vec<&str> = after_comm.split_whitespace().collect();
+    // fields[0] is state (field 3); utime=field 14, stime=field 15 => indices 11, 12 here.
+    let utime: u64 = fields.get(11)?.parse().ok()?;
+    let stime: u64 = fields.get(12)?.parse().ok()?;
+    Some(utime + stime)
 }
 
 fn resolve_in_path(name: &str) -> Option<String> {

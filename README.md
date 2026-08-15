@@ -21,9 +21,10 @@ Follow the instructions [here](https://github.com/mattwparas/helix/blob/steel-ev
 > export HELIX_RUNTIME=/path/to/helix/runtime
 > ```
 
-### 2. Julia conductor/client
+### 2. DaemonicCabal.jl and Rust conductor/client
 
-This repo ships Rust rewrites of the [DaemonicCabal](https://github.com/tecosaur/DaemonicCabal.jl) conductor and client binaries, derived directly from the Zig implementation and wire-compatible with the Julia worker. Build and install them with:
+The mechanism relies on the `DaemonWorker` module built in `DaemonicCabal.jl`.
+This repo also ships Rust rewrites of the [DaemonicCabal](https://github.com/tecosaur/DaemonicCabal.jl) conductor and client binaries, derived directly from the Zig implementation and wire-compatible with the Julia worker. Build and install them with:
 
 ```sh
 ./install.sh
@@ -40,6 +41,8 @@ Use the provided `quench` script, which resolves the session name automatically 
 ```sh
 quench
 ```
+
+you can pass all the usual julia flags.
 
 Set this as the command for your Julia pane in your Zellij/Tmux layout.
 
