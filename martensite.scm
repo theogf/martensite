@@ -4,22 +4,19 @@
 ;;; Requires `temper` to be on PATH.
 ;;; Default keybinding: C-j (normal and select modes), C-S-j for top-level
 
-(require "helix/misc.scm")        ; set-status!, set-warning!, set-error!, cursor-position
+(require "helix/misc.scm")        ; set-status!, set-warning!, set-error!, cursor-position, push-component!
 (require "helix/static.scm")      ; current-selection->string, get-helix-cwd
 (require "helix/editor.scm")      ; set-register!, editor-focus, editor->doc-id, editor->text
 (require "helix/ext.scm")         ; hx.with-context, spawn-native-thread
 (require "helix/treesitter.scm")  ; document->tree, tstree->root, tsnode-*
-(require (prefix-in helix. "helix/commands.scm")) ; helix.vsplit, helix.open
+(require "helix/components.scm")  ; markdown-component, new-component!, block/render, buffer/clear
 
 (require-builtin steel/process)      ; command, with-stdin, with-stdout-piped, spawn-process, wait->stdout
-(require-builtin steel/filesystem)   ; path-exists?, delete-file!
 (require-builtin helix/core/text) ; rope-char->byte, rope->byte-slice, rope->string
 (require "steel/result")          ; Ok?, unwrap-ok
 
 (provide send-to-julia-repl)
 (provide send-top-level-to-julia-repl)
-
-(define *julia-output-file* "/tmp/martensite-output.txt")
 
 ;; ─── Sending code ────────────────────────────────────────────────────────────
 
@@ -32,15 +29,62 @@
         unwrap-ok))
   (unwrap-ok (wait->stdout process)))
 
-;; Show output in a vsplit buffer, or just update the status bar if empty.
+;; ─── Output popup ───────────────────────────────────────────────────────────
+;; There's no single Steel helper for "bordered box, sized to content, anchored
+;; near the cursor" — build one the same way the built-in hover-doc popup (and
+;; e.g. mattwparas/helix-config's term.scm) does it: a custom component that
+;; clears its area and draws a `block` first, then renders a markdown-component
+;; inset by the border. row/col/width/height are computed once up front from
+;; the cursor position and the content size; render just clamps that box to
+;; stay on screen.
+(struct OutputPopup (markdown width height row col))
+
+(define (clamp lo hi v)
+  (max lo (min hi v)))
+
+(define *popup-max-width* 100)
+(define *popup-max-height* 20)
+
+(define (output-popup-render state rect frame)
+  (define w (min (OutputPopup-width state) (area-width rect)))
+  (define h (min (OutputPopup-height state) (area-height rect)))
+  (define max-x (max (area-x rect) (- (+ (area-x rect) (area-width rect)) w)))
+  (define max-y (max (area-y rect) (- (+ (area-y rect) (area-height rect)) h)))
+  (define x (clamp (area-x rect) max-x (OutputPopup-col state)))
+  (define y (clamp (area-y rect) max-y (OutputPopup-row state)))
+  (define box (area x y w h))
+  (buffer/clear frame box)
+  (block/render frame box (make-block (theme-scope-ref "ui.popup") (theme-scope-ref "ui.popup") "all" "rounded"))
+  (define inner (area (+ 1 x) (+ 1 y) (- w 2) (- h 2)))
+  (render-native-component (OutputPopup-markdown state) inner frame))
+
+;; Dismiss on any keypress, mirroring the built-in doc-popup behavior.
+;; handle_event fires for every event (redraws, resizes, etc.), not just key
+;; presses, so closing unconditionally closed the popup on the very next
+;; non-key tick — check key-event? first.
+(define (output-popup-handle-event state event)
+  (if (key-event? event) event-result/close event-result/ignore))
+
+;; Show output in a floating, bordered popup sized to fit the output and
+;; anchored just below the cursor, or just update the status bar if empty.
 (define (show-output! output)
-  (when (path-exists? *julia-output-file*)
-    (delete-file! *julia-output-file*))
-  (define out (open-output-file *julia-output-file*))
-  (write-string output out)
-  (close-output-port out)
-  (helix.vsplit)
-  (helix.open *julia-output-file*))
+  (define lines (split-many output "\n"))
+  (define content-width (apply max 1 (map string-length lines)))
+  (define content-height (length lines))
+  ;; +4 width: 2 border + 1 space padding each side. +4 height: 2 border + the
+  ;; two ``` fence lines wrapping the content.
+  (define box-width (clamp 20 *popup-max-width* (+ content-width 4)))
+  (define box-height (clamp 3 *popup-max-height* (+ content-height 4)))
+  (define cursor (car (current-cursor)))
+  (define anchor-row (if cursor (+ 1 (position-row cursor)) 0))
+  (define anchor-col (if cursor (position-col cursor) 0))
+  (define md (markdown-component (string-append "```\n" output "\n```")))
+  (define popup
+    (new-component! "martensite-output"
+                    (OutputPopup md box-width box-height anchor-row anchor-col)
+                    output-popup-render
+                    (hash "handle_event" output-popup-handle-event)))
+  (push-component! popup))
 
 ;; Send code string via temper and display output.
 (define (send-code! code)
