@@ -136,7 +136,10 @@ EOF
 
 echo "Installing systemd service: $SERVICE_FILE"
 systemctl --user daemon-reload
-systemctl --user enable --now "$SERVICE_NAME"
+systemctl --user enable "$SERVICE_NAME"
+# restart (not just enable --now): guarantees the freshly installed binary is
+# actually loaded even if the service was already running from a prior install.
+systemctl --user restart "$SERVICE_NAME"
 
 # --- Client symlink ---
 

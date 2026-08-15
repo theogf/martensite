@@ -78,7 +78,7 @@ C-j = ":send-to-julia-repl"
 - `send-to-julia-repl` — yank the code you want to send (`y`), then press `C-j`
 - `send-top-level-to-julia-repl` — place the cursor anywhere inside a function/block and press `C-S-j`; it walks the tree-sitter parse tree up to the top-level node and sends it automatically
 
-Output from the Julia session is shown in a vsplit buffer.
+Output from the Julia session is shown in a floating popup (dismiss with any keypress).
 
 ## Session resolution
 
