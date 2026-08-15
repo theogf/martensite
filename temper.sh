@@ -19,7 +19,7 @@ fi
 if [[ $# -eq 1 && -f "$1" ]]; then
     exec juliaclient --session="$session" --sync -- "$1"
 elif [[ $# -ge 1 ]]; then
-    exec juliaclient --session="$session" --sync --eval "$*"
+    exec juliaclient --session="$session" --sync --print "$*"
 else
-    exec juliaclient --session="$session" --sync --eval "$(cat)"
+    exec juliaclient --session="$session" --sync --print "$(cat)"
 fi
