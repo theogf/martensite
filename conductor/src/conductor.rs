@@ -850,12 +850,18 @@ impl Conductor {
         let w_id = info.worker_id;
         let activity_hl = self.activity_half_life();
         let budget_hl = self.budget_occ_half_life();
+        let mut retire_interactive = false;
         if let Some(w) = self.get_worker_mut(w_id) {
             if w.active_clients > 0 { w.active_clients -= 1; }
             w.last_active = unix_time();
             if w.active_clients == 0 {
                 w.occ_fast.detach(w.last_active, activity_hl);
                 w.occ_slow.detach(w.last_active, budget_hl);
+                // Interactive sessions are ephemeral by design: once the last
+                // attached client leaves, the worker goes with it rather than
+                // sitting in the pool waiting for a future --session reattach
+                // (unlike non-interactive workers, which are meant to be reused).
+                retire_interactive = w.interactive;
             }
         }
         let now_us = std::time::SystemTime::now()
@@ -865,8 +871,23 @@ impl Conductor {
         let dur_us = now_us - info.start_time_us;
         eprintln!("Client {} disconnected; worker: {}, duration: {}.{:03}s",
             info.client_num, w_id, dur_us / 1_000_000, (dur_us % 1_000_000) / 1_000);
+
+        if retire_interactive {
+            if let Some(key) = self.find_worker_key(w_id) {
+                eprintln!("Worker {}: interactive session ended, retiring", w_id);
+                self.retire_worker(&key, w_id);
+            }
+            return None;
+        }
+
         let active = self.get_worker_mut(w_id).map(|w| w.active_clients).unwrap_or(1);
         if active == 0 { Some(w_id) } else { None }
+    }
+
+    fn find_worker_key(&self, id: u32) -> Option<String> {
+        self.workers.iter()
+            .find(|(_, list)| list.iter().any(|w| w.id == id))
+            .map(|(k, _)| k.clone())
     }
 
     fn remove_active_clients_for_worker(&mut self, w_id: u32) {
