@@ -10,6 +10,13 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Local checkout of DaemonicCabal.jl — its worker/ subdirectory is a
+# self-contained Julia package (DaemonWorker, stdlib deps only) that gets
+# copied verbatim into the install dir, matching what DaemonicCabal.jl's own
+# installer does (src/installers/common.jl: install_files). There is no
+# registered "DaemonicCabal" package to Pkg.add — it must come from here.
+DAEMONIC_CABAL_SRC="${DAEMONIC_CABAL_SRC:-$HOME/.julia/dev/DaemonicCabal}"
+
 # --- Paths ---
 
 XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
@@ -75,21 +82,27 @@ cargo build --release --manifest-path "$SCRIPT_DIR/Cargo.toml"
 
 CONDUCTOR_BIN="$SCRIPT_DIR/target/release/julia-conductor"
 CLIENT_BIN="$SCRIPT_DIR/target/release/juliaclient"
+WORKER_SRC="$DAEMONIC_CABAL_SRC/worker"
 
 [[ -f "$CONDUCTOR_BIN" ]] || { echo "ERROR: $CONDUCTOR_BIN not found"; exit 1; }
 [[ -f "$CLIENT_BIN" ]]    || { echo "ERROR: $CLIENT_BIN not found"; exit 1; }
+[[ -f "$WORKER_SRC/Project.toml" ]] || {
+    echo "ERROR: $WORKER_SRC/Project.toml not found."
+    echo "Set DAEMONIC_CABAL_SRC to your DaemonicCabal.jl checkout (expected a worker/ subdirectory)."
+    exit 1
+}
 
 # --- Install files ---
+# Validated above before touching anything, so a missing/misconfigured
+# DaemonicCabal checkout fails loudly instead of wiping a working install.
 
 echo "Installing to $INSTALL_DIR"
 chmod -R u+w "$INSTALL_DIR" 2>/dev/null || true
 rm -rf "$INSTALL_DIR"
 mkdir -p "$INSTALL_DIR"
 
-# Julia @daemonic environment
-echo "Setting up @daemonic Julia environment..."
-"${JULIA_DAEMON_WORKER_EXECUTABLE:-julia}" -e \
-    'import Pkg; Pkg.activate("@daemonic", shared=true); Pkg.add("DaemonicCabal")'
+echo "Copying worker package from $WORKER_SRC..."
+cp -r "$WORKER_SRC" "$INSTALL_DIR/worker"
 
 cp "$CONDUCTOR_BIN" "$CONDUCTOR_DST"
 cp "$CLIENT_BIN"    "$CLIENT_DST"
@@ -98,7 +111,7 @@ chmod 755 "$CONDUCTOR_DST" "$CLIENT_DST"
 # --- Systemd service ---
 
 JULIA_BIN="${JULIA_DAEMON_WORKER_EXECUTABLE:-$(command -v julia || echo julia)}"
-WORKER_PROJECT="${JULIA_DAEMON_WORKER_PROJECT:-@daemonic}"
+WORKER_PROJECT="${JULIA_DAEMON_WORKER_PROJECT:-$INSTALL_DIR/worker}"
 
 mkdir -p "$(dirname "$SERVICE_FILE")"
 

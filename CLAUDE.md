@@ -39,7 +39,7 @@ The Rust binaries track DaemonicCabal.jl 0.5.0's wire protocol, including the ad
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `JULIA_DAEMON_WORKER_PROJECT` | `@daemonic` | Julia project/environment for workers |
+| `JULIA_DAEMON_WORKER_PROJECT` | `~/.local/share/julia-daemon/worker` | Julia project/environment for workers |
 | `JULIA_DAEMON_SERVER` | `<runtime_dir>/conductor.sock` | Socket path or `tcp://host:port` |
 | `JULIA_DAEMON_RUNTIME` | `/run/user/$UID/julia-daemon` | Runtime directory |
 | `JULIA_DAEMON_WORKER_EXECUTABLE` | `julia` | Julia binary |
@@ -61,11 +61,11 @@ The actual idle budget a given worker gets is adaptive, not a flat MIN/MAX_TTL c
 
 What it does:
 1. `cargo build --release`
-2. Creates a `@daemonic` Julia environment via `Pkg.add("DaemonicCabal")`
+2. Copies `worker/` from `$DAEMONIC_CABAL_SRC` (default `~/.julia/dev/DaemonicCabal`) to `~/.local/share/julia-daemon/worker` — this is `DaemonWorker`, a self-contained Julia package (stdlib deps only) that isn't a registered package, so it can't be `Pkg.add`ed; it has to be copied from a DaemonicCabal.jl checkout, exactly like DaemonicCabal.jl's own installer does (`src/installers/common.jl`)
 3. Copies binaries to `~/.local/share/julia-daemon/`
-4. Writes `~/.config/systemd/user/julia-daemon.service` (with `JULIA_DAEMON_WORKER_PROJECT=@daemonic`) and enables it
+4. Writes `~/.config/systemd/user/julia-daemon.service` (with `JULIA_DAEMON_WORKER_PROJECT=~/.local/share/julia-daemon/worker`) and enables it
 5. Symlinks `juliaclient` → `~/.local/bin/juliaclient`
-6. Copies `quench.sh` → `~/.local/bin/quench`
+6. Copies `quench.sh`/`temper.sh` → `~/.local/bin/quench`/`~/.local/bin/temper`
 
 ### DaemonicCabal patches
 

@@ -146,7 +146,8 @@ pub fn parse(args: &[String]) -> ParsedArgs {
                 switches.push(Switch { name: name.to_string(), value: String::new() });
             } else {
                 let value = if arg.len() > 2 {
-                    arg[2..].to_string()
+                    // Accept both glued (`-t4`) and `=`-separated (`-t=4`) forms.
+                    arg[2..].strip_prefix('=').unwrap_or(&arg[2..]).to_string()
                 } else {
                     let v = args.get(i).cloned().unwrap_or_default();
                     if args.get(i).is_some() { i += 1; }
