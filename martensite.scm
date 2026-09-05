@@ -57,6 +57,7 @@
 (provide eval-in-julia)
 (provide eval-top-level-in-julia)
 (provide julia-session-info)
+(provide interrupt-julia)
 
 ;; ─── Session resolution ──────────────────────────────────────────────────────
 ;; Resolves a *name*, not a socket: `jld` already keys a daemon on the project
@@ -206,8 +207,28 @@
 ;; Captured eval: output comes back to us, the developer's prompt is never
 ;; touched, `ans` is not set. --max-output caps a runaway print loop so it
 ;; cannot swamp the popup.
+;; Optional cap on how long an `eval-*` send may run, in seconds; #false (the
+;; default) means no cap.
+;;
+;; Off deliberately. jld escalates a timeout it cannot deliver: if the eval does
+;; not reach a yield point within 3s of the interrupt, a *spawned* daemon is
+;; SIGKILLed and its Main lost (client.jl escalate_timeout). A session daemon —
+;; what quench creates — is explicitly spared there, but anyone driving a
+;; `jld connect` daemon would lose their state to a stray infinite loop. The
+;; plugin cannot tell which topology it is talking to, so it does not choose for
+;; you: set this only if a lost Main is acceptable. `interrupt-julia` covers the
+;; common case without the risk.
+(define *eval-timeout-seconds* #f)
+
+(define (timeout-flag)
+  (if *eval-timeout-seconds*
+      (list (string-append "--timeout=" (int->string *eval-timeout-seconds*)))
+      '()))
+
 (define (jld-eval code)
-  (run-jld (list (name-flag) "--max-output=16k" "eval" code)))
+  (run-jld (append (list (name-flag) "--max-output=16k")
+                   (timeout-flag)
+                   (list "eval" code))))
 
 ;; Paste into the live prompt: bracketed-paste injection into the REPL's tty
 ;; buffer (repl_input.jl), so it is echoed at the prompt, evaluated by the REPL
@@ -473,6 +494,15 @@
        (equal? (length (split-many body "\n")) 1)
        (<= (string-length body) *status-inline-max*)))
 
+;; jld's exit codes: 0 ok, 1 Julia error, 3 unreachable / no REPL attached,
+;; 124 timed out, 130 interrupted. The last two are indistinguishable from a
+;; plain success otherwise, since both usually come back with no output at all.
+(define (describe-exit code)
+  (cond
+    [(equal? code 130) "martensite: interrupted"]
+    [(equal? code 124) "martensite: timed out"]
+    [else "martensite: evaluated"]))
+
 (define (report! result status)
   (define body (strip-startup-banner (JldResult-output result)))
   (cond
@@ -500,7 +530,8 @@
   (cond
     [(equal? mode 'eval)
      (define result (jld-eval code))
-     (hx.with-context (lambda () (report! result "martensite: evaluated")))]
+     (hx.with-context
+       (lambda () (report! result (describe-exit (JldResult-code result)))))]
     [else
      (define result (jld-eval-repl code))
      (hx.with-context
@@ -633,3 +664,36 @@
       "from:     " (cdr pair) "\n"
       (strip-startup-banner (JldResult-output result))))
   (hx.with-context (lambda () (show-output! text #f " session "))))
+
+;;@doc
+;; Interrupt whatever the Julia session is currently evaluating. The interrupt
+;; lands at the eval's next yield point, so CPU-bound code that never yields may
+;; run to completion regardless — jld's `--force` kills and restarts the daemon
+;; in that case, which is not offered here because it would take a `jld connect`
+;; session's Main with it.
+;;
+;; This is also what unwedges a send: an `eval-*` whose evaluation never returns
+;; leaves its background thread blocked on the jld subprocess, and interrupting
+;; releases it with exit 130.
+(define (interrupt-julia)
+  (spawn-native-thread
+    (lambda ()
+      (with-handler
+        (lambda (e)
+          (define msg (call-with-output-string (lambda (port) (display e port))))
+          (hx.with-context
+            (lambda () (set-error! (string-append "martensite error: " msg)))))
+        (interrupt-inner!))))
+  (set-status! "martensite: interrupting…"))
+
+(define (interrupt-inner!)
+  (define result (run-jld (list (name-flag) "interrupt")))
+  (define body (strip-startup-banner (JldResult-output result)))
+  (hx.with-context
+    (lambda ()
+      (cond
+        [(starts-with? body "jld: nothing to interrupt")
+         (set-status! "martensite: nothing running")]
+        [(equal? (JldResult-code result) 0)
+         (set-status! "martensite: interrupt sent — lands at the next yield point")]
+        [else (set-error! (string-append "martensite: " (one-line body)))]))))

@@ -135,6 +135,7 @@ you weren't looking.
 | `eval-in-julia` | the current selection | in a popup; your prompt is untouched |
 | `eval-top-level-in-julia` | top-level form under the cursor | in a popup; your prompt is untouched |
 | `julia-session-info` | — | a popup naming the session, where the name came from, and the daemon's id and state |
+| `interrupt-julia` | — | interrupts whatever the session is evaluating |
 
 Bind them in `~/.config/helix/config.toml`. The same block works for both modes:
 
@@ -203,6 +204,23 @@ keypress. Its frame carries the signal the text can't: an error draws the
 border in your theme's error colour and titles it ` error `, and when the output
 is taller than the box a ` ⋯ +N more ` badge on the bottom border says how much
 was cut (`jld trace` in your REPL gives the full backtrace).
+
+## Interrupting
+
+`interrupt-julia` stops whatever the session is currently evaluating. Worth
+binding — a send that never returns leaves its background thread blocked on the
+`jld` subprocess, and interrupting is what releases it.
+
+The interrupt lands at the eval's **next yield point**, so CPU-bound code that
+never yields may run to completion anyway. `jld interrupt --force` handles that
+by killing and restarting the daemon; the plugin does not offer it, because on a
+`jld connect` session that would take your `Main` with it.
+
+There is also `*eval-timeout-seconds*` in `martensite.scm`, off by default, which
+adds `--timeout` to `eval-*` sends. It is off for the same reason: a timeout jld
+cannot deliver escalates to SIGKILLing the daemon. A `quench` session is
+explicitly spared — jld refuses to kill an interactive session — but a
+`jld connect` daemon is not, so the plugin does not turn it on for you.
 
 ## Session resolution
 
