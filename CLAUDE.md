@@ -121,10 +121,19 @@ serving itself as a jld session. It is a script, not a shell function, because a
 Zellij/tmux layout names it as the pane `command` and execs it directly. It is
 not installed anywhere — layouts reference it by path in the checkout.
 
-Its name cascade must stay identical to `resolve-session` in `martensite.scm`,
-sanitizer included (`tr -c 'A-Za-z0-9_.-' '-'` there, `sanitize-name` here). If
+Its name cascade must stay identical to `resolve-session` in `martensite.scm` —
+sanitizer (`tr -c 'A-Za-z0-9_.-' '-'` there, `sanitize-name` here) and the
+`.juliasession` walk-up (`find_juliasession` / `juliasession-name`) included. If
 you change one, change the other: the whole point is that both sides derive the
 same daemon id without talking to each other.
+
+**The walk-up is not optional.** `.juliasession` is searched by walking up from
+the cwd, stopping at the project root, because `jld` resolves the *project* half
+of the id that way. Checking only the cwd meant a Helix opened in a subdirectory
+resolved the name to `repl` while jld still resolved the project by walking up —
+two ids that disagree, surfacing only as `no REPL attached`. In Steel the walk
+needs no filesystem module: `first-line` returns `#f` for a missing file, so it
+is just successively higher relative paths.
 
 ## The output popup
 

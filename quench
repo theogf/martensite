@@ -15,12 +15,36 @@ set -eu
 # yields two different daemon ids with nothing to indicate it. jld keys the
 # daemon on the *project* anyway, so the name only has to disambiguate several
 # REPLs on one project.
+# Walk UP for .juliasession, because jld finds the project half of the daemon id
+# the same way. Looking only in the current directory meant that starting from a
+# subdirectory resolved the name to "repl" while jld still walked up for the
+# project — two ids that silently disagree. Stops at the project root, the same
+# boundary jld uses, so a stray .juliasession higher up cannot leak in. Must stay
+# in step with juliasession-name in martensite.scm.
+find_juliasession() {
+    dir=$PWD
+    depth=0
+    while [ "$depth" -lt 12 ]; do
+        if [ -f "$dir/.juliasession" ]; then
+            head -1 "$dir/.juliasession"
+            return 0
+        fi
+        if [ -f "$dir/Project.toml" ] || [ -f "$dir/JuliaProject.toml" ]; then
+            return 1
+        fi
+        [ "$dir" = "/" ] && return 1
+        dir=$(dirname "$dir")
+        depth=$((depth + 1))
+    done
+    return 1
+}
+
 if [ -n "${MARTENSITE_SESSION:-}" ]; then
     session=$MARTENSITE_SESSION
 elif [ -n "${JLD_NAME:-}" ]; then
     session=$JLD_NAME
-elif [ -f .juliasession ]; then
-    session=$(head -1 .juliasession)
+elif session=$(find_juliasession); then
+    :
 else
     session=repl
 fi

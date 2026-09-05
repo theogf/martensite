@@ -56,6 +56,7 @@
 (provide send-top-level-to-julia-repl)
 (provide eval-in-julia)
 (provide eval-top-level-in-julia)
+(provide julia-session-info)
 
 ;; ─── Session resolution ──────────────────────────────────────────────────────
 ;; Resolves a *name*, not a socket: `jld` already keys a daemon on the project
@@ -123,17 +124,53 @@
 (define (sanitize-name s)
   (list->string (map (lambda (c) (if (name-safe-char? c) c #\-)) (string->list s))))
 
-(define (resolve-session)
-  (sanitize-name (resolve-session-raw)))
+;; How far up to look for .juliasession before giving up. The walk normally
+;; stops at the project root long before this.
+(define *juliasession-search-depth* 12)
 
-(define (resolve-session-raw)
-  (or (env-or-false "MARTENSITE_SESSION")
-      ;; jld's own override, honored so that one variable set in a Zellij/tmux
-      ;; layout names the session on both sides at once — the plugin reads it
-      ;; here, `jld connect` reads it from make_ctx.
-      (env-or-false "JLD_NAME")
-      (first-line ".juliasession")
-      *default-session-name*))
+;; Find .juliasession by walking UP from the working directory, because jld
+;; finds the project half of the daemon id the same way. Checking only the cwd
+;; meant that opening Helix in a subdirectory resolved the name to "repl" while
+;; jld still resolved the project by walking up — two ids that silently disagree,
+;; and a send that reports "no REPL attached" with no hint why.
+;;
+;; No filesystem module is needed: first-line already yields #f for a file that
+;; is not there, so the walk is just successively higher relative paths.
+;;
+;; The walk stops at the project root — the same boundary jld uses — so a stray
+;; .juliasession in $HOME cannot be picked up from an unrelated project below it.
+(define (juliasession-name)
+  (let loop ([prefix ""] [depth 0])
+    (if (> depth *juliasession-search-depth*)
+        #f
+        (let ([here (first-line (string-append prefix ".juliasession"))])
+          (cond
+            [here here]
+            [(or (first-line (string-append prefix "Project.toml"))
+                 (first-line (string-append prefix "JuliaProject.toml")))
+             #f]
+            [else (loop (string-append prefix "../") (+ depth 1))])))))
+
+;; The resolved name paired with which cascade entry produced it. The source is
+;; what `julia-session-info` reports: "why is it asking for that name?" is the
+;; question worth answering when the two sides disagree.
+(define (session-and-source)
+  (let ([explicit (env-or-false "MARTENSITE_SESSION")])
+    (if explicit
+        (cons explicit "MARTENSITE_SESSION")
+        ;; jld's own override, honored so one variable set per-pane in a layout
+        ;; names the session on both sides at once — the plugin reads it here,
+        ;; `jld` reads it from make_ctx.
+        (let ([jld-name (env-or-false "JLD_NAME")])
+          (if jld-name
+              (cons jld-name "JLD_NAME")
+              (let ([from-file (juliasession-name)])
+                (if from-file
+                    (cons from-file ".juliasession")
+                    (cons *default-session-name* "default"))))))))
+
+(define (resolve-session)
+  (sanitize-name (car (session-and-source))))
 
 ;; ─── jld invocation ──────────────────────────────────────────────────────────
 ;; Both stdout and stderr are piped and captured — Julia writes errors and
@@ -326,7 +363,7 @@
 
 ;; Show output in a floating, bordered popup anchored just below the cursor,
 ;; sized to what the content actually needs.
-(define (show-output! output error?)
+(define (show-output! output error? title)
   ;; Replace any popup from a still-open previous call rather than stacking a
   ;; new one on top of it.
   (pop-last-component-by-name! "martensite-output")
@@ -348,7 +385,6 @@
   ;; line after the first staircases further right.
   (vte/advance-bytes vte (string-replace output "\n" "\r\n"))
 
-  (define title (if error? " error " " julia "))
   ;; NB: `theme-scope`'s Scheme wrapper injects *helix.cx* itself —
   ;; `(theme-scope "error")`, one argument. The deprecated `theme->fg`/
   ;; `theme->bg` are direct aliases and take the context explicitly, so they
@@ -444,7 +480,8 @@
     [(inline-result? result body) (set-status! (string-append "julia: " body))]
     [else
      (set-status! status)
-     (show-output! body (not (equal? (JldResult-code result) 0)))]))
+     (define failed (not (equal? (JldResult-code result) 0)))
+     (show-output! body failed (if failed " error " " julia "))]))
 
 ;; The two modes are deliberately not interchangeable, and neither falls back to
 ;; the other:
@@ -560,3 +597,35 @@
 ;; the REPL prompt; the result is shown in a popup.
 (define (eval-top-level-in-julia)
   (dispatch-top-level! 'eval))
+
+;;@doc
+;; Report which Julia session this directory resolves to, and what jld makes of
+;; that name. Run this first when a send says "no REPL attached": it shows the
+;; name the plugin asked for, which cascade entry produced it, and the daemon id
+;; and state that name maps to — which is exactly where the two sides disagree
+;; when they do.
+(define (julia-session-info)
+  (spawn-native-thread
+    (lambda ()
+      (with-handler
+        (lambda (e)
+          (define msg (call-with-output-string (lambda (port) (display e port))))
+          (hx.with-context
+            (lambda () (set-error! (string-append "martensite error: " msg)))))
+        (session-info-inner!))))
+  (set-status! "martensite: querying session…"))
+
+(define (session-info-inner!)
+  (define pair (session-and-source))
+  (define raw (car pair))
+  (define name (sanitize-name raw))
+  (define result (run-jld (list (name-flag) "status")))
+  (define text
+    (string-append
+      "name:     " name "\n"
+      ;; Shown only when sanitizing changed it: that rewrite is invisible
+      ;; otherwise, and is a classic source of id mismatch.
+      (if (equal? raw name) "" (string-append "raw:      " raw "\n"))
+      "from:     " (cdr pair) "\n"
+      (strip-startup-banner (JldResult-output result))))
+  (hx.with-context (lambda () (show-output! text #f " session "))))
