@@ -14,4 +14,10 @@ else
     session=$(pwd)
 fi
 
-exec juliaclient --session="$session" -i "$@"
+
+# --sync is required for this session to register as a SyncSession on the
+# worker at all (worker/src/setup.jl: sync_session_label bails to nothing
+# without it) — without it, `temper` calls targeting this same --session
+# label create their own orphan session with no attached listeners, so their
+# echoed input/result never reaches this terminal.
+exec juliaclient --session="$session" --sync -i "$@"
