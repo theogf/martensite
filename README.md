@@ -97,6 +97,7 @@ That's the whole installation.
 | `send-top-level-to-julia-repl` | top-level tree-sitter form under the cursor | in your REPL, at the prompt, `ans` set |
 | `eval-in-julia` | last-yanked text | in a popup; your prompt is untouched |
 | `eval-top-level-in-julia` | top-level form under the cursor | in a popup; your prompt is untouched |
+| `julia-session-info` | — | a popup naming the session, where the name came from, and the daemon's id and state |
 
 Bind them in `~/.config/helix/config.toml`:
 
@@ -150,9 +151,16 @@ several sessions on one project. The plugin resolves it as:
 1. **`MARTENSITE_SESSION`** environment variable, if set.
 2. **`JLD_NAME`** — `jld`'s own override, honored here too so that one variable
    set per-pane in a layout names the session on both sides at once.
-3. **`.juliasession` file** — its first line, if the file exists in the project root.
+3. **`.juliasession` file** — its first line. Searched by walking **up** from the
+   working directory, stopping at the project root, so it is found from a
+   subdirectory too — `jld` finds the project half of the id the same way, and
+   the two must agree.
 4. **`repl`** — the default, which is also what `JuliaDaemon.serve()` picks with
    no arguments.
+
+If a send ever reports `no REPL attached`, run `:julia-session-info`: it prints
+the name the plugin asked for, which entry above produced it, and the daemon id
+and state that name maps to — which is where the two sides disagree when they do.
 
 Most of the time you need none of these: one REPL per project resolves to `repl`
 on both sides and just works. Reach for `.juliasession` (or `JLD_NAME`) only to
