@@ -93,6 +93,14 @@ Two things that are easy to get wrong here:
   `v1.12-<name>-<hash>` while the plugin computes `<project>-<name>-<hash>`,
   and the two never meet — the failure looks like "no REPL attached" plus a
   second daemon quietly autostarting.
+- **Sanitize the session name before passing it anywhere.** `jld` cleans names
+  in one of two code paths only: `serve_session` replaces `[^A-Za-z0-9_.-]` with
+  `-` and hashes the *sanitized* name, while `make_ctx` hashes what it was
+  given, raw. So `Tab #1` yields `martensite-Tab--1-4a1dabfa` from a serving
+  REPL and `martensite-Tab #1-e9dd730d` from the CLI — two daemons that never
+  meet. `sanitize-name` does this up front; it is strict ASCII on purpose
+  (`char-alphabetic?` would keep `é`, which Julia's `[A-Za-z]` does not).
+  Zellij's default tab name is exactly this shape, so it is not a corner case.
 - **`JuliaDaemon` is not importable from a normal REPL.** `Pkg.app add` puts it
   in `~/.julia/environments/apps/JuliaDaemon`, off the default load path.
   Appending that env to `JULIA_LOAD_PATH` makes it importable without adding it

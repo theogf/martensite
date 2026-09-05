@@ -130,7 +130,30 @@
 ;; Cascade, highest priority first. Unlike the old version there is no cwd
 ;; fallback: the project *is* the cwd-derived half of the identity already, so
 ;; falling back to a fixed default name is what makes both topologies line up.
+;; jld sanitizes session names in two different places and at two different
+;; times: `serve_session` (daemon.jl) replaces [^A-Za-z0-9_.-] with "-" and then
+;; hashes the SANITIZED name, while `make_ctx` (client.jl) hashes the name it was
+;; given, raw. A name with a space in it therefore yields two different daemon
+;; ids and the two sides never meet — and Zellij's default tab name is "Tab #1".
+;;
+;; Sanitizing here, before the name is passed to either, makes both hash the same
+;; string. Strict ASCII on purpose: char-alphabetic? would keep "é", which Julia's
+;; [A-Za-z] does not. Verified character-for-character against Julia, multi-byte
+;; input included.
+(define (name-safe-char? c)
+  (define n (char->integer c))
+  (or (and (>= n 48) (<= n 57))                       ; 0-9
+      (and (>= n 65) (<= n 90))                       ; A-Z
+      (and (>= n 97) (<= n 122))                      ; a-z
+      (equal? n 45) (equal? n 46) (equal? n 95)))     ; - . _
+
+(define (sanitize-name s)
+  (list->string (map (lambda (c) (if (name-safe-char? c) c #\-)) (string->list s))))
+
 (define (resolve-session)
+  (sanitize-name (resolve-session-raw)))
+
+(define (resolve-session-raw)
   (or (env-or-false "MARTENSITE_SESSION")
       ;; jld's own override, honored so that one variable set in a Zellij/tmux
       ;; layout names the session on both sides at once — the plugin reads it
