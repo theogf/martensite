@@ -27,7 +27,6 @@
 (require-builtin steel/process)      ; command, with-stdout-piped, with-stderr-piped, spawn-process, child-stdout, child-stderr, wait
 (require-builtin steel/ports)        ; read-port-to-string, open-input-file, read-line-from-port
 (require-builtin steel/meta)         ; maybe-get-env-var
-(require-builtin steel/filesystem)   ; is-file?
 (require-builtin helix/core/text)    ; rope-char->byte, rope->byte-slice, rope->string
 (require "steel/result")             ; Ok?, unwrap-ok
 

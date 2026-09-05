@@ -54,6 +54,15 @@ function quench --description "Start a Julia REPL serving itself as a jld sessio
     else
         set session repl
     end
+    # Any branch above can come back as an EMPTY LIST rather than an empty
+    # string (a `zellij action` that fails, a blank .juliasession). In fish that
+    # makes `JLD_NAME=$session` vanish from the env call entirely instead of
+    # setting an empty value, and the session name would be unset.
+    set session (string replace -ra '[^A-Za-z0-9_.-]' '-' -- $session)
+    if test -z "$session"
+        set session repl
+    end
+
     # The apps env on LOAD_PATH makes JuliaDaemon importable without adding it
     # to any of your environments. --project=@. is required: jld walks up to the
     # nearest Project.toml, but plain julia does not — without it the session
@@ -61,7 +70,7 @@ function quench --description "Start a Julia REPL serving itself as a jld sessio
     env JULIA_LOAD_PATH="@:@v#.#:@stdlib:$HOME/.julia/environments/apps/JuliaDaemon" \
         JLD_NAME=$session \
         julia --project=@. $argv -i \
-        -e 'using JuliaDaemon; JuliaDaemon.serve(name = ENV["JLD_NAME"])'
+        -e 'using JuliaDaemon; JuliaDaemon.serve(name = get(ENV, "JLD_NAME", "repl"))'
 end
 ```
 
@@ -77,10 +86,12 @@ quench() {
     elif [[ -n "$TMUX" ]];       then session=$(tmux display-message -p '#W')
     else session=repl
     fi
+    session=$(printf '%s' "$session" | tr -c 'A-Za-z0-9_.-' '-')
+    [[ -z "$session" ]] && session=repl
     JULIA_LOAD_PATH="@:@v#.#:@stdlib:$HOME/.julia/environments/apps/JuliaDaemon" \
     JLD_NAME="$session" \
     julia --project=@. "$@" -i \
-        -e 'using JuliaDaemon; JuliaDaemon.serve(name = ENV["JLD_NAME"])'
+        -e 'using JuliaDaemon; JuliaDaemon.serve(name = get(ENV, "JLD_NAME", "repl"))'
 }
 ```
 </details>
