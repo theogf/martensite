@@ -296,6 +296,15 @@ Agents ─► jld --id=&lt;id&gt; eval ────────────► s
         <em>spawned</em> daemon's default name is the empty string, a different id
         entirely — so the name is always passed explicitly rather than omitted.
       </p>
+      <p style="margin-top:.9rem">
+        The <em>project</em> half has a matching trap on the REPL side.
+        <code>jld</code> walks up from the cwd to the nearest
+        <code>Project.toml</code>; plain <code>julia</code> does not, and falls back
+        to the default environment. A self-serving session started without
+        <code>--project=@.</code> therefore registers as
+        <code>v1.12-&lt;name&gt;</code> while the plugin computes
+        <code>&lt;project&gt;-&lt;name&gt;</code>, and the two never meet.
+      </p>
     </div>
   </div>
 

@@ -84,9 +84,20 @@ Two things that are easy to get wrong here:
   picks with no arguments. A *spawned* daemon's default name is the empty
   string (`client.jl` `make_ctx`), which is a **different id**. So the name is
   always passed explicitly on both sides rather than omitted.
-- **Do not pass `--project`.** `jld`'s `find_project` walks *up* from the cwd,
-  whereas an explicit `--project=DIR` demands a `Project.toml` at exactly that
-  directory and `die`s otherwise.
+- **Do not pass `--project` to `jld`.** Its `find_project` walks *up* from the
+  cwd, whereas an explicit `--project=DIR` demands a `Project.toml` at exactly
+  that directory and `die`s otherwise.
+- **But DO pass `--project=@.` to `julia`** when starting a self-serving
+  session. `jld` walks up to the nearest `Project.toml`; plain `julia` does
+  not, and defaults to `@v#.#`. Without it the session registers as
+  `v1.12-<name>-<hash>` while the plugin computes `<project>-<name>-<hash>`,
+  and the two never meet — the failure looks like "no REPL attached" plus a
+  second daemon quietly autostarting.
+- **`JuliaDaemon` is not importable from a normal REPL.** `Pkg.app add` puts it
+  in `~/.julia/environments/apps/JuliaDaemon`, off the default load path.
+  Appending that env to `JULIA_LOAD_PATH` makes it importable without adding it
+  to any environment. `isinteractive()` is already true during `-e` under `-i`,
+  so `serve()` from `-e` does register the paste socket.
 
 ## Steel gotchas
 

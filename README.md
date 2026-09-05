@@ -34,11 +34,14 @@ will symlink it into `~/.local/bin` if it isn't already).
 
 Both sides derive the session name from the same context, so they find each
 other without either being told. The plugin does its half itself; give your
-shell the matching half once, in your own config:
+shell the matching half once, in your own config.
+
+`quench` starts a plain Julia REPL that serves *itself* as a jld session — no
+separate daemon process, no second prompt, and its state dies with the terminal:
 
 ```fish
 # ~/.config/fish/config.fish
-function quench --description "Attach a jld REPL named after the current context"
+function quench --description "Start a Julia REPL serving itself as a jld session"
     set -l session
     if set -q JLD_NAME
         set session $JLD_NAME
@@ -51,7 +54,14 @@ function quench --description "Attach a jld REPL named after the current context
     else
         set session repl
     end
-    jld connect --name=$session $argv
+    # The apps env on LOAD_PATH makes JuliaDaemon importable without adding it
+    # to any of your environments. --project=@. is required: jld walks up to the
+    # nearest Project.toml, but plain julia does not — without it the session
+    # registers under the default env and the two sides never meet.
+    env JULIA_LOAD_PATH="@:@v#.#:@stdlib:$HOME/.julia/environments/apps/JuliaDaemon" \
+        JLD_NAME=$session \
+        julia --project=@. $argv -i \
+        -e 'using JuliaDaemon; JuliaDaemon.serve(name = ENV["JLD_NAME"])'
 end
 ```
 
@@ -61,48 +71,52 @@ end
 ```bash
 quench() {
     local session
-    if [[ -n "$JLD_NAME" ]]; then session="$JLD_NAME"
+    if   [[ -n "$JLD_NAME" ]];   then session="$JLD_NAME"
     elif [[ -f .juliasession ]]; then session=$(head -1 .juliasession)
-    elif [[ -n "$ZELLIJ" ]]; then session=$(zellij action current-tab-info | head -1 | sed 's/^[^:]*: //')
-    elif [[ -n "$TMUX" ]]; then session=$(tmux display-message -p '#W')
+    elif [[ -n "$ZELLIJ" ]];     then session=$(zellij action current-tab-info | head -1 | sed 's/^[^:]*: //')
+    elif [[ -n "$TMUX" ]];       then session=$(tmux display-message -p '#W')
     else session=repl
     fi
-    jld connect --name="$session" "$@"
+    JULIA_LOAD_PATH="@:@v#.#:@stdlib:$HOME/.julia/environments/apps/JuliaDaemon" \
+    JLD_NAME="$session" \
+    julia --project=@. "$@" -i \
+        -e 'using JuliaDaemon; JuliaDaemon.serve(name = ENV["JLD_NAME"])'
 }
 ```
 </details>
 
-Then `quench` is your Julia pane's command in your Zellij/Tmux layout, exactly
-as before. If you would rather not carry a shell function at all, set `JLD_NAME`
-per-pane in the layout instead: both the plugin and `jld` read it directly, and
-plain `jld connect` then lands on the right session with no wrapper.
+Make `quench` your Julia pane's command in your Zellij/Tmux layout. It prints
+the session id and the commands agents can use against it. `jld list` shows it
+as `idle/repl`, which marks it a human's live REPL.
 
-That form — `jld connect` — puts `Main` in a daemon that outlives the terminal,
-so closing and reattaching **resumes the previous session's state**.
+Setting `JLD_NAME` also means any `jld` you run *from inside* that pane targets
+the same session automatically. If you set `JLD_NAME` per-pane in the layout
+instead, the cascade short-circuits to it on both sides and you need no wrapper
+at all.
+
+<details>
+<summary>Alternative: <code>jld connect</code>, if you want state that outlives the terminal</summary>
+
+Swap the last three lines for `jld connect --name=$session $argv`. `Main` then
+lives in a daemon, so closing and reattaching **resumes the previous session's
+state** rather than starting clean.
 
 > [!WARNING]
-> `jld connect` gives you two prompts, and sends follow whichever one is active.
-> Backspace at an empty `julia@<id}>` prompt drops you to a plain `julia>` — the
-> connect script's *own* local Julia, with no project, no Revise, and none of
-> your packages. A `C-j` from Helix pasted there evaluates in that process
+> This form gives you two prompts, and sends follow whichever is active.
+> Backspace at an empty `julia@<id>>` prompt drops you to a plain `julia>` —
+> the connect script's *own* local Julia, with no project, no Revise and none
+> of your packages. A `C-j` from Helix pasted there evaluates in that process
 > instead of your session, silently and wrongly.
 >
 > **Press `>` at the empty `julia>` prompt to get back.** It is a mode key like
 > `]`, `?` and `;`; the connect banner mentions how to leave but not how to
 > return.
+</details>
 
-Serving your own session has neither problem — there is no local/remote split,
-and its state dies with the terminal:
-
-```julia
-using JuliaDaemon
-JuliaDaemon.serve(name = "…")   # the same resolved name
-```
-
-The `eval-*` commands work whether or not a REPL is attached — with none
-running, `jld` starts a daemon on the first send. The `send-*` commands need an
-attached REPL by definition: with none, they report `jld`'s own error rather
-than quietly evaluating somewhere you weren't looking.
+The `eval-*` commands work whether or not a REPL is running — with none, `jld`
+starts a daemon on the first send. The `send-*` commands need one by definition:
+with none, they report `jld`'s own error rather than quietly evaluating
+somewhere you weren't looking.
 
 ## Installation
 
