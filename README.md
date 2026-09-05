@@ -9,7 +9,7 @@ A [Steel](https://github.com/mattwparas/steel) plugin for [Helix](https://helix-
 The whole plugin is one file, `martensite.scm`. There is no daemon to install, no
 systemd unit, no binary to build, and no install script to run.
 
-## Prerequisites
+## Setup
 
 ### 1. Helix — steel branch
 
@@ -30,31 +30,78 @@ julia -e 'using Pkg; Pkg.app add url="https://github.com/KristofferC/JuliaDaemon
 That installs `jld` into `~/.julia/bin`. Put it on your `PATH` (`jld install`
 will symlink it into `~/.local/bin` if it isn't already).
 
-### 3. A Julia session named from context
+### 3. martensite
 
-The repo ships `quench`: a dependency-free POSIX `sh` script that starts a plain
-Julia REPL which serves *itself* as a jld session. One process, one prompt, and
-its state dies with the terminal.
+The repo is a Steel package (`cog.scm`), so it goes on the cog path and is
+required by name:
 
-There is nothing to install. Point your Zellij/Tmux layout at it where it sits:
+```sh
+forge pkg install --git https://github.com/theogf/martensite
+```
+
+```scheme
+;; ~/.config/helix/init.scm
+(require "martensite/martensite.scm")
+```
+
+That is the whole installation — one file of Steel, no daemon, no service, no
+build step.
+
+<details>
+<summary>Installing a checkout instead, to hack on the plugin</summary>
+
+`forge` clones a snapshot into the cogs directory, so edits to a checkout
+elsewhere would not be picked up. Symlink it instead:
+
+```sh
+ln -s /path/to/martensite ~/.local/share/steel/cogs/martensite
+```
+
+The require stays the same, and the loaded plugin then follows your working
+tree — including whichever branch is checked out.
+
+Requiring the file by absolute path also still works and needs no install at
+all: `(require "/path/to/martensite/martensite.scm")`.
+</details>
+
+### 4. A Julia session named from context
+
+The package ships `quench`: a dependency-free POSIX `sh` script that starts a
+plain Julia REPL which serves *itself* as a jld session. One process, one prompt,
+and its state dies with the terminal.
+
+It lives in the cogs directory — the same path whether you installed with `forge`
+or symlinked a checkout:
+
+```
+~/.local/share/steel/cogs/martensite/quench
+```
+
+Naming it as a pane command directly is why it is a script rather than a shell
+function: a layout execs the command instead of going through a shell. That also
+means the layout gets no shell expansion, so put it on your `PATH` and refer to
+it by name:
+
+```sh
+ln -s ~/.local/share/steel/cogs/martensite/quench ~/.local/bin/quench
+```
 
 ```kdl
 pane {
-    command "/path/to/martensite/quench"
+    command "quench"
     name "Julia"
 }
 ```
 
-Naming it as the pane command directly is why it is a script rather than a shell
-function — a layout execs the command instead of going through a shell. Run it
-by hand the same way, and pass any extra Julia flags straight through:
+Spelling out the full absolute path in `command` works too. A leading `~` may
+not — a layout is not a shell, and I have not verified that Zellij expands it
+there.
+
+Run it by hand the same way, passing any extra Julia flags straight through:
 
 ```sh
-/path/to/martensite/quench --threads=auto
+quench --threads=auto
 ```
-
-Symlink it onto your `PATH` if you would rather type `quench`, but nothing
-requires it.
 
 <details>
 <summary>Alternative: <code>jld connect</code>, if you want state that outlives the terminal</summary>
@@ -76,18 +123,8 @@ reattaching **resumes the previous session's state**.
 
 The `eval-*` commands work whether or not a REPL is running — with none, `jld`
 starts a daemon on the first send. The `send-*` commands need one by definition:
-with none, they report `jld`'s own error rather than quietly evaluating
-somewhere you weren't looking.
-
-## Installation
-
-Require the plugin from your Helix `init.scm` (`~/.config/helix/init.scm`):
-
-```scheme
-(require "/path/to/martensite/martensite.scm")
-```
-
-That's the whole installation.
+with none, they report `jld`'s own error rather than quietly evaluating somewhere
+you weren't looking.
 
 ## Usage
 
