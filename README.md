@@ -130,27 +130,52 @@ you weren't looking.
 
 | Command | Sends | Result appears |
 |---|---|---|
-| `send-to-julia-repl` | last-yanked text (`.` register) | in your REPL, at the prompt, `ans` set |
+| `send-to-julia-repl` | the current selection | in your REPL, at the prompt, `ans` set |
 | `send-top-level-to-julia-repl` | top-level tree-sitter form under the cursor | in your REPL, at the prompt, `ans` set |
-| `eval-in-julia` | last-yanked text | in a popup; your prompt is untouched |
+| `eval-in-julia` | the current selection | in a popup; your prompt is untouched |
 | `eval-top-level-in-julia` | top-level form under the cursor | in a popup; your prompt is untouched |
 | `julia-session-info` | — | a popup naming the session, where the name came from, and the daemon's id and state |
 
-Bind them in `~/.config/helix/config.toml`:
+Bind them in `~/.config/helix/config.toml`. The same block works for both modes:
 
 ```toml
 [keys.normal]
-C-j = ":send-to-julia-repl"
-C-S-j = ":send-top-level-to-julia-repl"
-A-j = ":eval-in-julia"
+C-ret   = ":send-to-julia-repl"
+C-S-ret = ":eval-in-julia"
+A-ret   = ":send-top-level-to-julia-repl"
+A-S-ret = ":eval-top-level-in-julia"
 
 [keys.select]
-C-j = ":send-to-julia-repl"
+C-ret   = ":send-to-julia-repl"
+C-S-ret = ":eval-in-julia"
+A-ret   = ":send-top-level-to-julia-repl"
+A-S-ret = ":eval-top-level-in-julia"
 ```
 
+Two independent axes: the base modifier picks **what** is sent — `Ctrl` the
+yanked text, `Alt` the top-level form under the cursor — and `Shift` picks
+**where the answer goes**, adding it to bring the result back into Helix instead
+of running it in the REPL.
+
+> [!NOTE]
+> `Enter` chords need the Kitty keyboard protocol to be distinguishable at all —
+> in legacy terminal encoding `Ctrl+Enter` is the same byte as `Ctrl+J` (`0x0A`),
+> which is why `C-j` is the traditional send-to-REPL binding. In Helix that means
+> `kitty-keyboard-protocol = "enabled"` under `[editor]`; its default of `"auto"`
+> asks the terminal for its flags and treats silence as unsupported, and a
+> multiplexer will not answer. `Alt+Enter` survives legacy encoding as `ESC`+`CR`,
+> so it keeps working where `Ctrl+Enter` does not — but `Alt+Shift+Enter` still
+> needs the protocol to carry the Shift.
+>
+> If none of that is available, `C-j` / `C-S-j` / `A-j` / `A-S-j` map cleanly onto
+> the same four commands.
+
 **Workflow:**
-- `send-to-julia-repl` — yank the code you want to send (`y`), then press `C-j`
-- `send-top-level-to-julia-repl` — place the cursor anywhere inside a function/block and press `C-S-j`; it walks the tree-sitter parse tree up to the top-level node and sends it automatically
+- select the code you want and press `C-ret` to run it in your REPL — add `Shift` to get the result in a popup instead. No yank needed: the `.` register *is* the current selection, read live from the document.
+- or put the cursor anywhere inside a function/block and press `A-ret`: it walks the tree-sitter parse tree up to the top-level node and sends that, no selection needed
+
+With multiple cursors, every selection is sent, joined by newlines — `.` yields
+one fragment per selection.
 
 The two pairs are not interchangeable, and neither falls back to the other —
 pick the one that matches where you want the answer.
