@@ -32,111 +32,42 @@ will symlink it into `~/.local/bin` if it isn't already).
 
 ### 3. A Julia session named from context
 
-Both sides derive the session name from the same context, so they find each
-other without either being told. The plugin does its half itself; give your
-shell the matching half once, in your own config.
+The repo ships `quench`: a dependency-free POSIX `sh` script that starts a plain
+Julia REPL which serves *itself* as a jld session. One process, one prompt, and
+its state dies with the terminal.
 
-`quench` starts a plain Julia REPL that serves *itself* as a jld session — no
-separate daemon process, no second prompt, and its state dies with the terminal:
+There is nothing to install. Point your Zellij/Tmux layout at it where it sits:
 
-```fish
-# ~/.config/fish/functions/quench.fish
-function quench --description "Start a Julia REPL that serves itself as a jld session"
-    # Session name. Every source is an env var or a file — never a probe of the
-    # terminal multiplexer. `zellij action current-tab-info` was tried and
-    # removed: the Helix plugin resolves the name independently, so one side
-    # could succeed while the other failed, silently producing two different
-    # daemon ids. (It also needs ZELLIJ_SESSION_NAME and, without it, prints a
-    # session-picker message to stdout instead of failing.) jld keys the daemon
-    # on the project anyway, so the name only disambiguates several REPLs on one
-    # project — use .juliasession or JLD_NAME for that.
-    set -l session
-    if test -n "$MARTENSITE_SESSION"
-        set session $MARTENSITE_SESSION
-    else if test -n "$JLD_NAME"
-        set session $JLD_NAME
-    else if test -f .juliasession
-        set session (head -1 .juliasession | string trim)
-    else
-        set session repl
-    end
-
-    # jld hashes the name into the daemon id but sanitizes it in only one of the
-    # two code paths (serve_session does, make_ctx does not), so do it up front
-    # and both sides hash the same string.
-    set session (string replace -ra '[^A-Za-z0-9_.-]' '-' -- $session)
-
-    # A branch above can yield an empty LIST rather than an empty string (a blank
-    # .juliasession). In fish that makes `JLD_NAME=$session` vanish from the env
-    # call entirely instead of setting an empty value, leaving JLD_NAME unset.
-    if test -z "$session"
-        set session repl
-    end
-
-    # JULIA_LOAD_PATH: the apps env makes JuliaDaemon importable without adding
-    # it to any of your environments (Pkg.app add installs it off the default
-    # load path).
-    #
-    # --project=@.: mandatory. jld walks up to the nearest Project.toml; plain
-    # julia does not and would default to @v#.#, registering the session under
-    # the wrong project so the plugin never finds it.
-    #
-    # JLD_NAME is exported so any `jld` run from inside this REPL targets this
-    # same session.
-    env JULIA_LOAD_PATH="@:@v#.#:@stdlib:$HOME/.julia/environments/apps/JuliaDaemon" \
-        JLD_NAME=$session \
-        julia --project=@. $argv -i \
-        -e 'using JuliaDaemon; JuliaDaemon.serve(name = get(ENV, "JLD_NAME", "repl"))'
-end
-```
-
-<details>
-<summary>bash / zsh</summary>
-
-```bash
-quench() {
-    # Every source is an env var or a file — never a probe of the multiplexer.
-    # See the note under "Session resolution" for why.
-    local session
-    if   [[ -n "$MARTENSITE_SESSION" ]]; then session="$MARTENSITE_SESSION"
-    elif [[ -n "$JLD_NAME" ]];           then session="$JLD_NAME"
-    elif [[ -f .juliasession ]];         then session=$(head -1 .juliasession)
-    else session=repl
-    fi
-    # jld sanitizes the name in only one of the two places it derives an id.
-    session=$(printf '%s' "$session" | tr -c 'A-Za-z0-9_.-' '-')
-    [[ -z "$session" ]] && session=repl
-
-    JULIA_LOAD_PATH="@:@v#.#:@stdlib:$HOME/.julia/environments/apps/JuliaDaemon" \
-    JLD_NAME="$session" \
-    julia --project=@. "$@" -i \
-        -e 'using JuliaDaemon; JuliaDaemon.serve(name = get(ENV, "JLD_NAME", "repl"))'
+```kdl
+pane {
+    command "/path/to/martensite/quench"
+    name "Julia"
 }
 ```
-</details>
 
-Make `quench` your Julia pane's command in your Zellij/Tmux layout. It prints
-the session id and the commands agents can use against it. `jld list` shows it
-as `idle/repl`, which marks it a human's live REPL.
+Naming it as the pane command directly is why it is a script rather than a shell
+function — a layout execs the command instead of going through a shell. Run it
+by hand the same way, and pass any extra Julia flags straight through:
 
-Setting `JLD_NAME` also means any `jld` you run *from inside* that pane targets
-the same session automatically. If you set `JLD_NAME` per-pane in the layout
-instead, the cascade short-circuits to it on both sides and you need no wrapper
-at all.
+```sh
+/path/to/martensite/quench --threads=auto
+```
+
+Symlink it onto your `PATH` if you would rather type `quench`, but nothing
+requires it.
 
 <details>
 <summary>Alternative: <code>jld connect</code>, if you want state that outlives the terminal</summary>
 
-Swap the last three lines for `jld connect --name=$session $argv`. `Main` then
-lives in a daemon, so closing and reattaching **resumes the previous session's
-state** rather than starting clean.
+`jld connect --name=<session>` puts `Main` in a daemon instead, so closing and
+reattaching **resumes the previous session's state**.
 
 > [!WARNING]
-> This form gives you two prompts, and sends follow whichever is active.
+> That form gives you two prompts, and sends follow whichever is active.
 > Backspace at an empty `julia@<id>>` prompt drops you to a plain `julia>` —
 > the connect script's *own* local Julia, with no project, no Revise and none
-> of your packages. A `C-j` from Helix pasted there evaluates in that process
-> instead of your session, silently and wrongly.
+> of your packages. A send pasted there evaluates in that process instead of
+> your session, silently and wrongly.
 >
 > **Press `>` at the empty `julia>` prompt to get back.** It is a mode key like
 > `]`, `?` and `;`; the connect banner mentions how to leave but not how to

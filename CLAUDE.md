@@ -114,6 +114,18 @@ Two things that are easy to get wrong here:
   to any environment. `isinteractive()` is already true during `-e` under `-i`,
   so `serve()` from `-e` does register the paste socket.
 
+## `quench`
+
+`quench` is a POSIX `sh` script in the repo root that starts a plain Julia REPL
+serving itself as a jld session. It is a script, not a shell function, because a
+Zellij/tmux layout names it as the pane `command` and execs it directly. It is
+not installed anywhere — layouts reference it by path in the checkout.
+
+Its name cascade must stay identical to `resolve-session` in `martensite.scm`,
+sanitizer included (`tr -c 'A-Za-z0-9_.-' '-'` there, `sanitize-name` here). If
+you change one, change the other: the whole point is that both sides derive the
+same daemon id without talking to each other.
+
 ## Steel gotchas
 
 Both of these were found by running the code, not by reading it — see Testing.

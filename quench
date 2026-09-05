@@ -1,0 +1,55 @@
+#!/bin/sh
+# quench — start a Julia REPL that serves itself as a jld session, so the
+# martensite Helix plugin (and any agent) can send code to it.
+#
+# Install:  ln -s "$PWD/quench" ~/.local/bin/quench
+#
+# Deliberately POSIX sh and dependency-free: it is named directly as the pane
+# command in a Zellij/tmux layout, which execs rather than going through a
+# shell, so a shell function could not be used there.
+set -eu
+
+# Session name. Every source is an environment variable or a file — never a
+# probe of the terminal multiplexer. The Helix plugin resolves this name
+# independently, so a probe that succeeds on one side and fails on the other
+# yields two different daemon ids with nothing to indicate it. jld keys the
+# daemon on the *project* anyway, so the name only has to disambiguate several
+# REPLs on one project.
+if [ -n "${MARTENSITE_SESSION:-}" ]; then
+    session=$MARTENSITE_SESSION
+elif [ -n "${JLD_NAME:-}" ]; then
+    session=$JLD_NAME
+elif [ -f .juliasession ]; then
+    session=$(head -1 .juliasession)
+else
+    session=repl
+fi
+
+# jld hashes the name into the daemon id but sanitizes it in only one of the two
+# code paths that derive one: serve_session (daemon.jl) replaces
+# [^A-Za-z0-9_.-] with "-" and hashes the *sanitized* name, while make_ctx
+# (client.jl) hashes what it was handed. Doing it here means both hash the same
+# string. Must match sanitize-name in martensite.scm.
+session=$(printf '%s' "$session" | tr -c 'A-Za-z0-9_.-' '-')
+[ -n "$session" ] || session=repl
+
+# JuliaDaemon is installed with `Pkg.app add`, which puts it in the apps
+# environment — off the default load path, so `using JuliaDaemon` fails in a
+# normal REPL. Appending that env makes it importable without adding it to any
+# of your own environments.
+depot=${JULIA_DEPOT_PATH:-}
+depot=${depot%%:*}
+[ -n "$depot" ] || depot=$HOME/.julia
+JULIA_LOAD_PATH="@:@v#.#:@stdlib:$depot/environments/apps/JuliaDaemon"
+export JULIA_LOAD_PATH
+
+# Exported so any `jld` run from inside this REPL targets this same session.
+JLD_NAME=$session
+export JLD_NAME
+
+# --project=@. is mandatory: jld walks up to the nearest Project.toml, but plain
+# julia does not and would fall back to @v#.#, registering the session under the
+# wrong project so the plugin never finds it. It comes first so a caller's own
+# --project=... still wins.
+exec "${JULIA:-julia}" --project=@. "$@" -i \
+    -e 'using JuliaDaemon; JuliaDaemon.serve(name = get(ENV, "JLD_NAME", "repl"))'
