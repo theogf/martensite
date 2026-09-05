@@ -154,6 +154,16 @@ came from stale code and must stay visible.
 
 Steel has no `any?`; use `findf`, which returns the matching element or `#false`.
 
+**Watch the context argument.** Helix's `components.scm` is inconsistent about
+it: `theme-scope` is a Scheme *wrapper* that injects `*helix.cx*` itself, so it
+takes one argument — `(theme-scope "error")`. The deprecated `theme->fg` /
+`theme->bg` are direct aliases of the Rust functions and take the context
+explicitly — `(theme->fg *helix.cx*)`. Getting it wrong is an `ArityMismatch`
+raised when the plugin *loads*, not when the code runs, so it takes out every
+command in the file at once. This plugin uses `theme-scope` throughout for that
+reason; `theme->bg`/`theme->fg` map to the scopes `"ui.background"` and
+`"ui.text"`.
+
 ## Steel gotchas
 
 Both of these were found by running the code, not by reading it — see Testing.

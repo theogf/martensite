@@ -226,7 +226,7 @@
   (if raw (term/color-attribute raw) #f))
 
 ;; Builds a fresh Style per cell rather than reusing/defaulting one: there is
-;; no way to pull a bare Color? back out of theme->fg/theme->bg (they return a
+;; no way to pull a bare Color? back out of the theme lookups (they return a
 ;; whole Style?, which set-style-fg!/set-style-bg! choke on). Leaving fg/bg
 ;; unset on a Default-attribute cell means "don't touch what's already there" —
 ;; which is the block's theme colors that block/render already painted
@@ -279,7 +279,7 @@
   (define box (area x y w h))
   (define border (OutputPopup-border-style state))
   (buffer/clear frame box)
-  (block/render frame box (make-block (theme->bg *helix.cx*) border "all" "rounded"))
+  (block/render frame box (make-block (theme-scope "ui.background") border "all" "rounded"))
   ;; Title and overflow badge are drawn INTO the border row: make-block takes
   ;; only (style border-style borders border-type) and has no title support, so
   ;; overwriting the border cells is the way to label a box.
@@ -349,13 +349,18 @@
   (vte/advance-bytes vte (string-replace output "\n" "\r\n"))
 
   (define title (if error? " error " " julia "))
+  ;; NB: `theme-scope`'s Scheme wrapper injects *helix.cx* itself —
+  ;; `(theme-scope "error")`, one argument. The deprecated `theme->fg`/
+  ;; `theme->bg` are direct aliases and take the context explicitly, so they
+  ;; read `(theme->fg *helix.cx*)`. Passing the context to `theme-scope` as well
+  ;; is an ArityMismatch at load time; use one form throughout to avoid it.
   (define border
     (if error?
         ;; The theme's own error colour rather than a hardcoded red, so it sits
         ;; with the rest of the editor. A theme without the scope yields a
         ;; default Style, which is simply the unstyled border.
-        (theme-scope *helix.cx* "error")
-        (theme->fg *helix.cx*)))
+        (theme-scope "error")
+        (theme-scope "ui.text")))
 
   ;; Size to the content. Measured AFTER feeding, so the VTE's own wrapping is
   ;; already accounted for; clamped to the max box, and floored wide enough for
