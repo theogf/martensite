@@ -273,28 +273,27 @@ Agents ─► jld --id=&lt;id&gt; eval ────────────► s
         <li>
           <span class="priority-badge p1">1st</span>
           <span><code>MARTENSITE_SESSION</code>, then <code>JLD_NAME</code> —
-          the latter is <code>jld</code>'s own override, honored here too so that one
-          variable set in a layout names the session on both sides at once.</span>
+          the latter is <code>jld</code>'s own override, honored here too so one
+          variable set per-pane in a layout names the session on both sides at once.</span>
         </li>
         <li>
           <span class="priority-badge p2">2nd</span>
-          <span>First line of a <code>.juliasession</code> file in the project root —
-          a name that survives renaming the tab.</span>
+          <span>First line of a <code>.juliasession</code> file in the project root.</span>
         </li>
         <li>
           <span class="priority-badge p3">3rd</span>
-          <span>Zellij tab name, then tmux window name — probed by running
-          <code>zellij action current-tab-info</code> / <code>tmux display-message</code>,
-          gated on <code>ZELLIJ</code> / <code>TMUX</code> being set. Zellij reports
-          several <code>key: value</code> lines, so the first line is taken before
-          splitting on <code>": "</code>.</span>
+          <span><code>repl</code> — the default, and what
+          <code>JuliaDaemon.serve()</code> picks with no arguments.</span>
         </li>
       </ul>
       <p style="margin-top:.9rem">
-        Falling through all of those yields <code>repl</code>, which is what
-        <code>JuliaDaemon.serve()</code> picks with no arguments. Note that a
-        <em>spawned</em> daemon's default name is the empty string, a different id
-        entirely — so the name is always passed explicitly rather than omitted.
+        Every source is an environment variable or a file, never a probe of the
+        terminal multiplexer. A Zellij/tmux tab-name probe used to sit here and was
+        removed: the plugin and the REPL resolve independently, so a probe that
+        succeeds on one side and fails on the other derives two different daemon ids
+        with nothing to indicate it. Note also that a <em>spawned</em> daemon's
+        default name is the empty string, a different id entirely — so the name is
+        always passed explicitly rather than omitted.
       </p>
       <p style="margin-top:.9rem">
         The <em>project</em> half has a matching trap on the REPL side.

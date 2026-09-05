@@ -75,8 +75,15 @@ A daemon is keyed on **project + name**. `jld` derives the project itself by
 walking up from the subprocess cwd (inherited from Helix); the plugin supplies
 only the name, resolved by `resolve-session`:
 
-`MARTENSITE_SESSION` → `JLD_NAME` → `.juliasession` first line → Zellij tab →
-tmux window → `"repl"`.
+`MARTENSITE_SESSION` → `JLD_NAME` → `.juliasession` first line → `"repl"`.
+
+**Every source is an env var or a file, never a probe.** A Zellij/tmux tab-name
+probe used to sit in this cascade and was removed: the plugin and the REPL
+resolve independently, so a probe succeeding on one side and failing on the
+other yields two daemon ids and no error. `zellij action` needs
+`ZELLIJ_SESSION_NAME` and otherwise prints a session-picker message to *stdout*
+rather than failing, which a caller parses as a tab name. It bought nothing
+either — unnamed tabs are all `Tab #1`, so it never disambiguated anything.
 
 Two things that are easy to get wrong here:
 

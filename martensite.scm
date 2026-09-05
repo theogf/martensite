@@ -58,16 +58,27 @@
 (provide eval-top-level-in-julia)
 
 ;; ─── Session resolution ──────────────────────────────────────────────────────
-;; Replaces the cascade that used to live in quench.sh/temper.sh. It resolves a
-;; *name*, not a socket: `jld` already keys a daemon on the project (nearest
-;; Project.toml walking up from Helix's cwd), so the name only has to
-;; disambiguate several sessions on one project.
+;; Resolves a *name*, not a socket: `jld` already keys a daemon on the project
+;; (the nearest Project.toml walking up from Helix's cwd), so the name only has
+;; to disambiguate several REPLs on one project.
+;;
+;; Every source here is read from the environment or from a file, deliberately.
+;; An earlier version also probed `zellij action current-tab-info` and
+;; `tmux display-message`, mirroring the old quench.sh. That had to go: the
+;; plugin and the REPL probe independently, so one side can succeed while the
+;; other fails, and the two then derive different daemon ids with nothing to
+;; indicate it. That is not hypothetical — it is exactly how this broke in
+;; practice, with the REPL falling back to "repl" while the plugin resolved the
+;; tab name. `zellij action` also needs ZELLIJ_SESSION_NAME and, without it,
+;; prints a session-picker message to *stdout* rather than failing, so a naive
+;; caller parses that as a tab name. And with every tab named "Tab #1" by
+;; default, the probe contributed no disambiguation to pay for the risk.
 ;;
 ;; "repl" is the default on purpose — it is what JuliaDaemon.serve() picks when
-;; called with no arguments, so topology B needs zero configuration and
-;; topology A needs only `jld connect --name=repl`. Note that a *spawned*
-;; daemon's default name is "" (client.jl make_ctx), which is NOT the same id,
-;; so the name has to be passed explicitly on both sides rather than omitted.
+;; called with no arguments, so a self-serving session needs zero configuration.
+;; Note that a *spawned* daemon's default name is "" (client.jl make_ctx), which
+;; is NOT the same id, so the name is always passed explicitly rather than
+;; omitted.
 
 (define *default-session-name* "repl")
 
@@ -92,43 +103,6 @@
   (define r (wait proc))
   (if (Ok? r) (unwrap-ok r) -1))
 
-;; Capture a command's stdout, or #f if it fails to spawn or exits nonzero.
-;; Used for the multiplexer probes, which are expected to fail whenever Helix
-;; is not running under one.
-(define (capture-or-false prog args)
-  (with-handler
-    (lambda (e) #f)
-    (let* ([proc (~> (command prog args) with-stdout-piped with-stderr-piped
-                     spawn-process unwrap-ok)]
-           [out (read-port-to-string (child-stdout proc))]
-           [_ (read-port-to-string (child-stderr proc))]
-           [code (exit-code proc)])
-      (if (equal? code 0)
-          (let ([t (trim out)]) (if (equal? t "") #f t))
-          #f))))
-
-;; Zellij's first line is `name: <tab name>` — split on the first ": " rather
-;; than a fixed offset, so a format change degrades to a wrong-but-harmless name
-;; instead of a truncated one.
-(define (zellij-tab)
-  (and (env-or-false "ZELLIJ")
-       (let ([out (capture-or-false "zellij" (list "action" "current-tab-info"))])
-         (and out
-              ;; current-tab-info prints several `key: value` lines (name, id,
-              ;; position, ...) — take the first line BEFORE splitting, or the
-              ;; name comes back with the rest of the report glued to it.
-              (let ([pair (split-once (car (split-many out "\n")) ": ")])
-                (and pair
-                     (let ([name (trim (list-ref pair 1))])
-                       (if (equal? name "") #f name))))))))
-
-(define (tmux-window)
-  (and (env-or-false "TMUX")
-       (capture-or-false "tmux" (list "display-message" "-p" "#W"))))
-
-;; Cascade, highest priority first. Unlike the old version there is no cwd
-;; fallback: the project *is* the cwd-derived half of the identity already, so
-;; falling back to a fixed default name is what makes both topologies line up.
 ;; jld sanitizes session names in two different places and at two different
 ;; times: `serve_session` (daemon.jl) replaces [^A-Za-z0-9_.-] with "-" and then
 ;; hashes the SANITIZED name, while `make_ctx` (client.jl) hashes the name it was
@@ -159,8 +133,6 @@
       ;; here, `jld connect` reads it from make_ctx.
       (env-or-false "JLD_NAME")
       (first-line ".juliasession")
-      (zellij-tab)
-      (tmux-window)
       *default-session-name*))
 
 ;; ─── jld invocation ──────────────────────────────────────────────────────────

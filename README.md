@@ -40,33 +40,49 @@ shell the matching half once, in your own config.
 separate daemon process, no second prompt, and its state dies with the terminal:
 
 ```fish
-# ~/.config/fish/config.fish
-function quench --description "Start a Julia REPL serving itself as a jld session"
+# ~/.config/fish/functions/quench.fish
+function quench --description "Start a Julia REPL that serves itself as a jld session"
+    # Session name. Every source is an env var or a file — never a probe of the
+    # terminal multiplexer. `zellij action current-tab-info` was tried and
+    # removed: the Helix plugin resolves the name independently, so one side
+    # could succeed while the other failed, silently producing two different
+    # daemon ids. (It also needs ZELLIJ_SESSION_NAME and, without it, prints a
+    # session-picker message to stdout instead of failing.) jld keys the daemon
+    # on the project anyway, so the name only disambiguates several REPLs on one
+    # project — use .juliasession or JLD_NAME for that.
     set -l session
-    if set -q JLD_NAME
+    if test -n "$MARTENSITE_SESSION"
+        set session $MARTENSITE_SESSION
+    else if test -n "$JLD_NAME"
         set session $JLD_NAME
     else if test -f .juliasession
         set session (head -1 .juliasession | string trim)
-    else if set -q ZELLIJ
-        set session (zellij action current-tab-info | head -1 | string replace -r '^[^:]*: ' '')
-    else if set -q TMUX
-        set session (tmux display-message -p '#W')
     else
         set session repl
     end
-    # Any branch above can come back as an EMPTY LIST rather than an empty
-    # string (a `zellij action` that fails, a blank .juliasession). In fish that
-    # makes `JLD_NAME=$session` vanish from the env call entirely instead of
-    # setting an empty value, and the session name would be unset.
+
+    # jld hashes the name into the daemon id but sanitizes it in only one of the
+    # two code paths (serve_session does, make_ctx does not), so do it up front
+    # and both sides hash the same string.
     set session (string replace -ra '[^A-Za-z0-9_.-]' '-' -- $session)
+
+    # A branch above can yield an empty LIST rather than an empty string (a blank
+    # .juliasession). In fish that makes `JLD_NAME=$session` vanish from the env
+    # call entirely instead of setting an empty value, leaving JLD_NAME unset.
     if test -z "$session"
         set session repl
     end
 
-    # The apps env on LOAD_PATH makes JuliaDaemon importable without adding it
-    # to any of your environments. --project=@. is required: jld walks up to the
-    # nearest Project.toml, but plain julia does not — without it the session
-    # registers under the default env and the two sides never meet.
+    # JULIA_LOAD_PATH: the apps env makes JuliaDaemon importable without adding
+    # it to any of your environments (Pkg.app add installs it off the default
+    # load path).
+    #
+    # --project=@.: mandatory. jld walks up to the nearest Project.toml; plain
+    # julia does not and would default to @v#.#, registering the session under
+    # the wrong project so the plugin never finds it.
+    #
+    # JLD_NAME is exported so any `jld` run from inside this REPL targets this
+    # same session.
     env JULIA_LOAD_PATH="@:@v#.#:@stdlib:$HOME/.julia/environments/apps/JuliaDaemon" \
         JLD_NAME=$session \
         julia --project=@. $argv -i \
@@ -79,15 +95,18 @@ end
 
 ```bash
 quench() {
+    # Every source is an env var or a file — never a probe of the multiplexer.
+    # See the note under "Session resolution" for why.
     local session
-    if   [[ -n "$JLD_NAME" ]];   then session="$JLD_NAME"
-    elif [[ -f .juliasession ]]; then session=$(head -1 .juliasession)
-    elif [[ -n "$ZELLIJ" ]];     then session=$(zellij action current-tab-info | head -1 | sed 's/^[^:]*: //')
-    elif [[ -n "$TMUX" ]];       then session=$(tmux display-message -p '#W')
+    if   [[ -n "$MARTENSITE_SESSION" ]]; then session="$MARTENSITE_SESSION"
+    elif [[ -n "$JLD_NAME" ]];           then session="$JLD_NAME"
+    elif [[ -f .juliasession ]];         then session=$(head -1 .juliasession)
     else session=repl
     fi
+    # jld sanitizes the name in only one of the two places it derives an id.
     session=$(printf '%s' "$session" | tr -c 'A-Za-z0-9_.-' '-')
     [[ -z "$session" ]] && session=repl
+
     JULIA_LOAD_PATH="@:@v#.#:@stdlib:$HOME/.julia/environments/apps/JuliaDaemon" \
     JLD_NAME="$session" \
     julia --project=@. "$@" -i \
@@ -186,16 +205,24 @@ several sessions on one project. The plugin resolves it as:
 
 1. **`MARTENSITE_SESSION`** environment variable, if set.
 2. **`JLD_NAME`** — `jld`'s own override, honored here too so that one variable
-   set in a Zellij/tmux layout names the session on both sides at once.
+   set per-pane in a layout names the session on both sides at once.
 3. **`.juliasession` file** — its first line, if the file exists in the project root.
-4. **Zellij tab name** — if Helix is running inside Zellij.
-5. **Tmux window name** — if Helix is running inside tmux.
-6. **`repl`** — the last-resort default, which is also what `JuliaDaemon.serve()`
-   picks with no arguments.
+4. **`repl`** — the default, which is also what `JuliaDaemon.serve()` picks with
+   no arguments.
 
-Name your Zellij tabs or tmux windows meaningfully and both sides find each
-other automatically. Use `.juliasession` to pin a name that survives renaming
-the tab.
+Most of the time you need none of these: one REPL per project resolves to `repl`
+on both sides and just works. Reach for `.juliasession` (or `JLD_NAME`) only to
+run *several* REPLs against one project.
+
+> [!NOTE]
+> Earlier versions also probed the Zellij tab name and the tmux window name.
+> That was removed. The plugin and the REPL resolve the name independently, so a
+> probe that works on one side and fails on the other produces two different
+> daemon ids with nothing to show for it — which is exactly how it broke in
+> practice. `zellij action` also requires `ZELLIJ_SESSION_NAME` and, without it,
+> prints a session-picker message to stdout instead of failing, so the caller
+> parses that as a tab name. Every source above is an environment variable or a
+> file, and cannot half-work.
 
 ## Agents
 
