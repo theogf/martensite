@@ -187,13 +187,16 @@
 ;; renders captured output through a real VTE (steel-pty's
 ;; raw-virtual-terminal) rather than plain fenced markdown, so the VTE does its
 ;; own line-wrapping (and would interpret SGR codes if any arrived).
-(struct OutputPopup (vte width height row col))
+(struct OutputPopup (vte width height row col border-style title overflow))
 
 (define (clamp lo hi v)
   (max lo (min hi v)))
 
 (define *popup-max-width* 60)
 (define *popup-max-height* 10)
+;; Floor on the *inner* width so a two-character result still gets a box wide
+;; enough for its title rather than a sliver.
+(define *popup-min-inner-width* 16)
 
 ;; The VTE's actual row count — much taller than the popup ever shows, so a
 ;; long stacktrace doesn't scroll its own beginning off the top before render
@@ -236,6 +239,36 @@
   (when bg (set-style-bg! s bg))
   s)
 
+;; True rendered extent of what the VTE holds, as (width . height).
+;;
+;; This has to run AFTER the bytes are fed: the VTE applies its own wrapping, so
+;; its cell grid is the only accurate measure of how much space the content
+;; needs. Measuring the raw string instead would miss wrapping entirely and get
+;; long lines badly wrong — which is why the box used to be a fixed size.
+;;
+;; vte/iter-x is 1-indexed, so the maximum x IS the column count; vte/iter-y is
+;; 0-indexed, hence the +1. Blank cells are skipped so trailing padding and the
+;; unused tail of the 300-row scrollback don't inflate the result.
+(define (vte-extent vte)
+  (vte/reset-iterator! vte)
+  (let loop ([w 0] [h 0])
+    (if (vte/advance-iterator! vte)
+        (let ([cell (vte/iter-cell-str vte)])
+          (if (and (string? cell) (not (equal? (trim cell) "")))
+              (loop (max w (vte/iter-x vte)) (max h (+ 1 (vte/iter-y vte))))
+              (loop w h)))
+        (cons w h))))
+
+;; Writes a short label into a border row, clipped to stay inside the corners.
+(define (draw-badge! frame x y max-w text style)
+  (define room (- max-w 4))
+  (when (> room 0)
+    (frame-set-string! frame x y
+                       (if (> (string-length text) room)
+                           (substring text 0 room)
+                           text)
+                       style)))
+
 (define (output-popup-render state rect frame)
   (define w (min (OutputPopup-width state) (area-width rect)))
   (define h (min (OutputPopup-height state) (area-height rect)))
@@ -244,8 +277,20 @@
   (define x (clamp (area-x rect) max-x (OutputPopup-col state)))
   (define y (clamp (area-y rect) max-y (OutputPopup-row state)))
   (define box (area x y w h))
+  (define border (OutputPopup-border-style state))
   (buffer/clear frame box)
-  (block/render frame box (make-block (theme->bg *helix.cx*) (theme->fg *helix.cx*) "all" "rounded"))
+  (block/render frame box (make-block (theme->bg *helix.cx*) border "all" "rounded"))
+  ;; Title and overflow badge are drawn INTO the border row: make-block takes
+  ;; only (style border-style borders border-type) and has no title support, so
+  ;; overwriting the border cells is the way to label a box.
+  (draw-badge! frame (+ x 2) y w (OutputPopup-title state) (style-with-bold border))
+  (let ([hidden (OutputPopup-overflow state)])
+    (when (> hidden 0)
+      (define badge (string-append " ⋯ +" (int->string hidden) " more "))
+      (draw-badge! frame
+                   (max (+ x 2) (- (+ x w) (string-length badge) 2))
+                   (- (+ y h) 1)
+                   w badge border)))
   ;; +2, not +1: 1 cell for the border plus 1 cell of padding, so content
   ;; doesn't render flush against the border wall.
   (define inner-x (+ 2 x))
@@ -279,38 +324,62 @@
 (define (output-popup-handle-event state event)
   (if (key-event? event) event-result/close event-result/ignore))
 
-;; Show output in a floating, bordered popup anchored just below the cursor.
-;; The box size is fixed rather than content-derived: the VTE does its own
-;; line-wrapping internally, so pre-computing a tight content size for e.g. a
-;; long stacktrace line isn't straightforward.
-(define (show-output! output)
+;; Show output in a floating, bordered popup anchored just below the cursor,
+;; sized to what the content actually needs.
+(define (show-output! output error?)
   ;; Replace any popup from a still-open previous call rather than stacking a
   ;; new one on top of it.
   (pop-last-component-by-name! "martensite-output")
-  (define box-width *popup-max-width*)
-  (define box-height *popup-max-height*)
   (define vte (raw-virtual-terminal))
-  ;; Rows: far taller than the popup ever shows, windowed down to the visible
-  ;; rows in output-popup-render. A VTE sized to exactly the visible rows
-  ;; scrolls like a real terminal as it is fed — showing only the *tail* of a
-  ;; long stacktrace and cutting off the "ERROR: ..." message at the top, which
-  ;; is the useful part.
+  ;; Rows: far taller than the popup ever shows, windowed down at render time. A
+  ;; VTE sized to exactly the visible rows scrolls like a real terminal as it is
+  ;; fed — showing only the *tail* of a long stacktrace and cutting off the
+  ;; "ERROR: ..." message at the top, which is the useful part.
   ;;
-  ;; Cols: -4, not -2: border (2) + padding (2), matching inner-x/inner-y —
-  ;; otherwise the VTE wraps wider than the padded interior has room for.
-  (vte/resize vte *popup-vte-scrollback-rows* (- box-width 4))
+  ;; Cols: -4 for border (2) + padding (2), matching inner-x/inner-y in the
+  ;; renderer — otherwise the VTE wraps wider than the interior has room for.
+  (define max-inner-w (- *popup-max-width* 4))
+  (define max-inner-h (- *popup-max-height* 4))
+  (vte/resize vte *popup-vte-scrollback-rows* max-inner-w)
   ;; The captured output is piped (not a real pty), so it is plain Unix text
   ;; with bare \n — no kernel tty driver is present to translate that to \r\n.
   ;; This VTE is a faithful raw terminal emulator, so \n alone is just a
   ;; linefeed and does NOT return the cursor to column 0; without this, every
   ;; line after the first staircases further right.
   (vte/advance-bytes vte (string-replace output "\n" "\r\n"))
-  (define cursor (car (current-cursor)))
-  (define anchor-row (if cursor (+ 1 (position-row cursor)) 0))
-  (define anchor-col (if cursor (position-col cursor) 0))
+
+  (define title (if error? " error " " julia "))
+  (define border
+    (if error?
+        ;; The theme's own error colour rather than a hardcoded red, so it sits
+        ;; with the rest of the editor. A theme without the scope yields a
+        ;; default Style, which is simply the unstyled border.
+        (theme-scope *helix.cx* "error")
+        (theme->fg *helix.cx*)))
+
+  ;; Size to the content. Measured AFTER feeding, so the VTE's own wrapping is
+  ;; already accounted for; clamped to the max box, and floored wide enough for
+  ;; the title. Anything past the visible rows becomes the overflow count rather
+  ;; than being silently dropped, which is what used to happen.
+  (define extent (vte-extent vte))
+  (define content-h (max 1 (cdr extent)))
+  (define visible-h (min max-inner-h content-h))
+  (define inner-w
+    (clamp (max *popup-min-inner-width* (string-length title))
+           max-inner-w
+           (car extent)))
   (define popup
     (new-component! "martensite-output"
-                    (OutputPopup vte box-width box-height anchor-row anchor-col)
+                    (OutputPopup vte
+                                 (+ inner-w 4)
+                                 (+ visible-h 4)
+                                 (let ([cursor (car (current-cursor))])
+                                   (if cursor (+ 1 (position-row cursor)) 0))
+                                 (let ([cursor (car (current-cursor))])
+                                   (if cursor (position-col cursor) 0))
+                                 border
+                                 title
+                                 (- content-h visible-h))
                     output-popup-render
                     (hash "handle_event" output-popup-handle-event)))
   (push-component! popup))
@@ -324,10 +393,53 @@
       "jld failed with no output"
       (trim (car (split-many t "\n")))))
 
+;; jld prints a three-line banner to stderr when it has to cold-start a daemon,
+;; and we merge stderr into the captured output because that is where Julia
+;; writes errors. The banner would otherwise turn the first `1+1` of a session
+;; into a full-size popup of progress messages with the answer at the bottom.
+;;
+;; Matched on these three literals rather than the general `jld: ` prefix on
+;; purpose: jld says other things with that prefix — "Revise failed to apply
+;; changes" among them — which mean the output came from stale code and must NOT
+;; be hidden. Only the startup banner is dropped.
+(define *jld-startup-banner*
+  (list "jld: verifying" "jld: starting daemon" "jld: daemon ready"))
+
+;; findf returns the matching element (or #false); Steel has no `any?`.
+(define (startup-banner-line? line)
+  (if (findf (lambda (prefix) (starts-with? line prefix)) *jld-startup-banner*)
+      #t
+      #f))
+
+(define (strip-startup-banner text)
+  (trim (string-join
+          (filter (lambda (line) (not (startup-banner-line? line)))
+                  (split-many text "\n"))
+          "\n")))
+
+;; Widest result that goes to the status bar instead of a popup. Deliberately
+;; conservative: the status line is one row and shares it with the mode
+;; indicator, so anything near a full width would be truncated by Helix.
+(define *status-inline-max* 72)
+
+;; A short, single-line, successful result does not deserve a floating window —
+;; `2` in a 60x10 box was the old behaviour. Errors always get the popup, so the
+;; frame colour still carries the signal, and multi-line output always does, so
+;; structure is preserved.
+(define (inline-result? result body)
+  (and (equal? (JldResult-code result) 0)
+       (not (equal? body ""))
+       (equal? (length (split-many body "\n")) 1)
+       (<= (string-length body) *status-inline-max*)))
+
 (define (report! result status)
-  (set-status! status)
-  (unless (equal? (JldResult-output result) "")
-    (show-output! (JldResult-output result))))
+  (define body (strip-startup-banner (JldResult-output result)))
+  (cond
+    [(equal? body "") (set-status! status)]
+    [(inline-result? result body) (set-status! (string-append "julia: " body))]
+    [else
+     (set-status! status)
+     (show-output! body (not (equal? (JldResult-code result) 0)))]))
 
 ;; The two modes are deliberately not interchangeable, and neither falls back to
 ;; the other:

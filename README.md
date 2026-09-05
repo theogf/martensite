@@ -124,9 +124,22 @@ owns the evaluation, its output goes to your terminal, not back to Helix.
 
 The `eval-*` pair is the opposite trade: `jld` evaluates and hands back exactly
 what a REPL would show — streamed output plus the rendered value, with the usual
-semantics (`nothing` and a trailing `;` print nothing) — which lands in a
-floating popup (dismiss with any keypress). Your prompt is never touched, and
-`ans` is not set.
+semantics (`nothing` and a trailing `;` print nothing). Your prompt is never
+touched, and `ans` is not set.
+
+Where the answer lands depends on its size:
+
+| result | shown as |
+|---|---|
+| nothing printed | a status-line message |
+| one short line (`42`) | the status line, `julia: 42` |
+| anything longer, or an error | a floating popup, sized to the content |
+
+The popup is bordered, anchored below the cursor, and dismissed with any
+keypress. Its frame carries the signal the text can't: an error draws the
+border in your theme's error colour and titles it ` error `, and when the output
+is taller than the box a ` ⋯ +N more ` badge on the bottom border says how much
+was cut (`jld trace` in your REPL gives the full backtrace).
 
 ## Session resolution
 

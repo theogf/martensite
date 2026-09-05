@@ -126,6 +126,34 @@ sanitizer included (`tr -c 'A-Za-z0-9_.-' '-'` there, `sanitize-name` here). If
 you change one, change the other: the whole point is that both sides derive the
 same daemon id without talking to each other.
 
+## The output popup
+
+Sized to its content, not fixed. The measurement (`vte-extent`) runs *after*
+the bytes are fed to the VTE, because the VTE applies its own wrapping — its
+cell grid is the only accurate extent. Measuring the raw string would get long
+lines badly wrong: a 140-character line is really 56x3, not 140x1. Verified
+against the real dylib.
+
+`make-block` takes only `(style border-style borders border-type)` and has **no
+title support**, so the title and the overflow badge are drawn into the border
+row with `frame-set-string!` after `block/render`.
+
+Errors use `(theme-scope *helix.cx* "error")` as the border style rather than a
+hardcoded red, so it tracks the user's theme; a theme lacking the scope yields a
+default Style, which is just an unstyled border. This matters because
+[jld#5](https://github.com/KristofferC/JuliaDaemon.jl/issues/5) means the body
+text is always monochrome — the frame is the only thing that can carry signal.
+
+Short single-line successes go to the status line instead of a popup. That is
+also why `strip-startup-banner` exists: stderr is merged into the captured
+output (Julia writes errors there), so jld's three-line cold-start banner would
+otherwise make the first `1+1` of a session a full-size popup of progress
+messages. It matches three specific literals rather than the general `jld: `
+prefix **on purpose** — `jld: Revise failed to apply changes` means the output
+came from stale code and must stay visible.
+
+Steel has no `any?`; use `findf`, which returns the matching element or `#false`.
+
 ## Steel gotchas
 
 Both of these were found by running the code, not by reading it — see Testing.
