@@ -323,18 +323,31 @@
 
 ;; ─── Dispatch ────────────────────────────────────────────────────────────────
 
+;; Collapse a multi-line message into something the one-row status bar can show.
+(define (one-line text)
+  (define t (trim text))
+  (if (equal? t "")
+      "jld failed with no output"
+      (trim (car (split-many t "\n")))))
+
 (define (report! result status)
   (set-status! status)
   (unless (equal? (JldResult-output result) "")
     (show-output! (JldResult-output result))))
 
-;; 'eval  — captured; popup shows the result, dev's prompt untouched.
-;; 'repl  — pasted into the live prompt; result appears in the dev's terminal.
+;; The two modes are deliberately not interchangeable, and neither falls back to
+;; the other:
 ;;
-;; eval-repl exits 3 when no REPL is attached to this session. Rather than
-;; surfacing that as an error, fall back to a captured eval so a send still
-;; works before the developer has opened their REPL — the code runs in the same
-;; daemon either way, the result just lands in the popup instead of the prompt.
+;;   'repl — jld eval-repl. The REPL evaluates, so the result lands in the
+;;           developer's terminal and `ans` is set. The socket only acknowledges
+;;           the paste, so there is nothing here to show.
+;;   'eval — jld eval. We evaluate, so the result comes back and lands in the
+;;           popup, and the prompt is never touched.
+;;
+;; An earlier version silently retried a failed paste as a captured eval. That
+;; blurred the one distinction the two commands exist to express — pick the
+;; command that matches where you want the answer, and a missing REPL is an
+;; error to fix rather than a mode to switch into.
 (define (send-code-inner! code mode)
   (cond
     [(equal? mode 'eval)
@@ -342,17 +355,15 @@
      (hx.with-context (lambda () (report! result "martensite: evaluated")))]
     [else
      (define result (jld-eval-repl code))
-     (cond
-       [(equal? (JldResult-code result) 0)
-        (hx.with-context (lambda () (set-status! "martensite: sent to REPL")))]
-       [else
-        (define fallback (jld-eval code))
-        (hx.with-context
-          (lambda ()
-            ;; The status line carries the *reason* for the popup: without it a
-            ;; result appearing here instead of in the terminal looks like the
-            ;; paste silently did the wrong thing.
-            (report! fallback "martensite: no REPL attached — evaluated instead")))])]))
+     (hx.with-context
+       (lambda ()
+         (if (equal? (JldResult-code result) 0)
+             (set-status! "martensite: sent to REPL")
+             ;; jld's own message is already specific and actionable ("no REPL
+             ;; attached to <id>; start one with `jld connect`"), so pass it
+             ;; through rather than inventing a vaguer one. Flattened to a
+             ;; single line for the status bar.
+             (set-error! (string-append "martensite: " (one-line (JldResult-output result)))))))]))
 
 ;; Errors on the background thread otherwise vanish silently —
 ;; spawn-native-thread has no visible failure path — so surface whatever goes

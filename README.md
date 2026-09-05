@@ -78,17 +78,31 @@ per-pane in the layout instead: both the plugin and `jld` read it directly, and
 plain `jld connect` then lands on the right session with no wrapper.
 
 That form — `jld connect` — puts `Main` in a daemon that outlives the terminal,
-so closing and reattaching **resumes the previous session's state**. If you want
-a REPL whose state dies with its terminal, serve your own instead:
+so closing and reattaching **resumes the previous session's state**.
+
+> [!WARNING]
+> `jld connect` gives you two prompts, and sends follow whichever one is active.
+> Backspace at an empty `julia@<id}>` prompt drops you to a plain `julia>` — the
+> connect script's *own* local Julia, with no project, no Revise, and none of
+> your packages. A `C-j` from Helix pasted there evaluates in that process
+> instead of your session, silently and wrongly.
+>
+> **Press `>` at the empty `julia>` prompt to get back.** It is a mode key like
+> `]`, `?` and `;`; the connect banner mentions how to leave but not how to
+> return.
+
+Serving your own session has neither problem — there is no local/remote split,
+and its state dies with the terminal:
 
 ```julia
 using JuliaDaemon
 JuliaDaemon.serve(name = "…")   # the same resolved name
 ```
 
-Neither has to be running before you send code. With no REPL attached, sends
-fall back to a captured evaluation in the same daemon and the result appears in
-the popup instead of the terminal.
+The `eval-*` commands work whether or not a REPL is attached — with none
+running, `jld` starts a daemon on the first send. The `send-*` commands need an
+attached REPL by definition: with none, they report `jld`'s own error rather
+than quietly evaluating somewhere you weren't looking.
 
 ## Installation
 
@@ -125,13 +139,19 @@ C-j = ":send-to-julia-repl"
 - `send-to-julia-repl` — yank the code you want to send (`y`), then press `C-j`
 - `send-top-level-to-julia-repl` — place the cursor anywhere inside a function/block and press `C-S-j`; it walks the tree-sitter parse tree up to the top-level node and sends it automatically
 
+The two pairs are not interchangeable, and neither falls back to the other —
+pick the one that matches where you want the answer.
+
 The `send-*` pair is a real paste into the prompt: bracketed-paste injection, so
 the code is echoed, evaluated by the REPL itself, and sets `ans` — and any
 half-typed input of yours is stashed and put back afterwards. Because the REPL
 owns the evaluation, its output goes to your terminal, not back to Helix.
 
-The `eval-*` pair is the opposite trade: output comes back and lands in a
-floating popup (dismiss with any keypress), and your prompt is never touched.
+The `eval-*` pair is the opposite trade: `jld` evaluates and hands back exactly
+what a REPL would show — streamed output plus the rendered value, with the usual
+semantics (`nothing` and a trailing `;` print nothing) — which lands in a
+floating popup (dismiss with any keypress). Your prompt is never touched, and
+`ans` is not set.
 
 ## Session resolution
 

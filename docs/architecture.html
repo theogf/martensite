@@ -325,7 +325,9 @@ Agents ─► jld --id=&lt;id&gt; eval ────────────► s
       <p style="margin-top:.9rem">
         Because the REPL owns the evaluation, its output goes to the developer's
         terminal. The socket acknowledges the paste and nothing more, so this path
-        cannot populate the popup.
+        cannot populate the popup — which is the definition of the mode, not a
+        shortcoming of it. It does not fall back to the capture path: a missing
+        REPL is an error to fix, not a mode to switch into.
       </p>
     </div>
   </div>
@@ -355,7 +357,7 @@ Agents ─► jld --id=&lt;id&gt; eval ────────────► s
         <tr><th>Exit</th><th>Meaning</th><th>Plugin response</th></tr>
         <tr><td class="direction">0</td><td>evaluated</td><td>popup with the result</td></tr>
         <tr><td class="direction">1</td><td>Julia error</td><td>popup with the stacktrace</td></tr>
-        <tr><td class="direction">3</td><td>daemon unreachable, or no REPL attached</td><td>fall back to a captured eval</td></tr>
+        <tr><td class="direction">3</td><td>daemon unreachable, or no REPL attached</td><td>surface jld's own message in the status bar</td></tr>
       </table>
     </div>
   </div>

@@ -40,10 +40,34 @@ in where the result comes out.
 | `send-to-julia-repl`, `send-top-level-to-julia-repl` | `jld eval-repl` | the developer's terminal | set |
 | `eval-in-julia`, `eval-top-level-in-julia` | `jld eval` | Helix popup | not set |
 
+**Neither mode falls back to the other.** An early version retried a failed
+paste as a captured eval; that blurred the single distinction the two commands
+exist to express. With no REPL attached, `send-*` surfaces `jld`'s own error
+(`no REPL attached to <id>; start one with jld connect`) and stops.
+
+`jld eval` returns exactly what a REPL would show — streamed stdout/stderr plus
+the rendered value, honoring `nothing` and a trailing `;` — so the popup path
+needs nothing upstream.
+
 `eval-repl` is a genuine paste: `JuliaDaemon/src/repl_input.jl` writes the code
 into the REPL's `stdin` buffer wrapped in bracketed-paste markers, so LineEdit
 cannot tell it from a terminal paste — echoed, evaluated by the REPL, prompt
 redrawn, with any half-typed input stashed and restored around it.
+
+### `jld connect` has two prompts, and pastes follow the active one
+
+Verified by pasting `getpid()` in each: at `julia@<id>>` it reaches the daemon;
+after a backspace to the plain `julia>` the identical paste evaluates in the
+connect script's *own* local Julia (a different pid, no project, no Revise).
+
+martensite cannot detect or fix this — `repl.sock` injects into the tty buffer
+and has no mode awareness. `>` at the empty `julia>` returns to the daemon mode
+(`install_mode`'s `enter_key` in `connect_repl.jl`, merged into the main mode
+like `]`/`?`/`;`). Topology B (`JuliaDaemon.serve()`) has no such split and is
+immune.
+
+If a user reports "sends go somewhere wrong" or "UndefVarError for things that
+are definitely loaded", check which prompt they are sitting at first.
 
 ### Session identity
 
@@ -116,21 +140,23 @@ send exercises stacktrace rendering.
 
 ## Upstream gaps
 
-Both are in JuliaDaemon.jl, and both are worked around in `martensite.scm`
-rather than patched locally.
+One, in JuliaDaemon.jl, worked around in `martensite.scm` rather than patched
+locally. Filed as
+[KristofferC/JuliaDaemon.jl#5](https://github.com/KristofferC/JuliaDaemon.jl/issues/5).
 
-1. **`eval-repl` never returns the result.** `serve_input` acknowledges as soon
-   as the bytes are in the tty buffer — before the REPL has parsed them — and
-   `cmd_eval_repl` (`client.jl`) reads only that `done` frame. So the paste path
-   has nothing to show in a popup. Polling `jld transcript` afterwards is not a
-   fix: it races the evaluation, and a *session* daemon records inputs with
-   empty output (`install_session_input_transcript`, `status = "input"`).
-2. **`jld eval` output is always monochrome.** The request struct has a
+(`eval-repl` also never returns the evaluated result — `serve_input`
+acknowledges as soon as the bytes are in the tty buffer, and `cmd_eval_repl`
+reads only that `done` frame. This is deliberately *not* treated as a gap: it
+is what makes the paste mode the paste mode. Don't build on the transcript to
+work around it — that races the evaluation, and a session daemon records inputs
+with empty output anyway.)
+
+1. **`jld eval` output is always monochrome.** The request struct has a
    `color::Bool` field (`daemon.jl`), parsed from the request and threaded into
    both `render` and `format_error` as `IOContext(:color => ...)` — but only
    `connect_repl.jl` ever sets it true, and the CLI has no flag. The daemon side
    is complete; only a client flag is missing.
 
-The popup's VTE machinery is kept despite (2): it costs nothing, still does the
+The popup's VTE machinery is kept despite this: it costs nothing, still does the
 line-wrapping the popup relies on, and would light up for free if a `--color`
 flag lands.
