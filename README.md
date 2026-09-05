@@ -188,8 +188,9 @@ the tab.
 
 ## Agents
 
-Agents share the session without touching your prompt. Given the id from
-`jld list`:
+Agents share the session without touching your prompt. A `quench` session shows
+up in `jld list` with state **`idle/repl`**, which is how an agent recognises a
+human's live REPL rather than a daemon it may restart or stop. Given its id:
 
 ```sh
 jld --id=<id> eval '<code>'      # captured output; your prompt is untouched
@@ -198,5 +199,8 @@ jld --id=<id> transcript         # read what you have been doing
 ```
 
 `jld install` drops an agent skill into `~/.agents/skills` (and the skills
-directories of installed agents) documenting this, including the rule never to
-kill a session that is a human's live REPL.
+directories of installed agents — `~/.claude`, `~/.codex`) documenting exactly
+this: spot `idle/repl`, read `jld transcript` first for context, eval into the
+session, show results with `jld eval-repl`, and never `jld kill` a human's REPL
+(`jld stop` refuses it automatically). So agents do not need to be told any of
+this per-project — it travels with `jld`, not with martensite.
