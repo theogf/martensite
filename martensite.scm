@@ -491,6 +491,10 @@
 
 ;; ─── Code extraction ─────────────────────────────────────────────────────────
 
+;; The `.` register is Helix's *selection contents* — read live from the document
+;; (register.rs: doc.selection(view.id).fragments(text)), not the last yank, which
+;; is `"`. So no yank step is needed, and a multi-cursor selection yields one
+;; fragment per cursor, which is why they are joined rather than taken singly.
 (define (selection-code)
   (string-join (register->value #\.) "\n"))
 
@@ -539,7 +543,7 @@
 ;;@doc
 ;; Paste the current selection into the live Julia REPL, as if typed there:
 ;; echoed at the prompt, `ans` set, result shown in the developer's terminal.
-;; Falls back to a captured eval (result in a popup) if no REPL is attached.
+;; With several cursors, every selection is sent, joined by newlines.
 (define (send-to-julia-repl)
   (dispatch-selection! 'repl))
 
