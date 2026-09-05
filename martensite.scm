@@ -1,8 +1,21 @@
 ;;; martensite.scm
-;;; Steel plugin for Helix: send current selection to a DaemonicCabal.jl server.
+;;; Steel plugin for Helix: send Julia code to a live REPL served by
+;;; JuliaDaemon.jl (`jld`).
 ;;;
-;;; Requires `temper` to be on PATH.
-;;; Default keybinding: C-j (normal and select modes), C-S-j for top-level
+;;; Requires `jld` on PATH:
+;;;   julia -e 'using Pkg; Pkg.app add url="https://github.com/KristofferC/JuliaDaemon.jl"'
+;;;
+;;; On the Julia side, either topology works — both must name the session, and
+;;; the name has to match *resolve-session* below (default "repl"):
+;;;
+;;;   A. daemon owns Main, thin REPL attached:  jld connect --name=repl
+;;;   B. your own julia serves itself:          using JuliaDaemon
+;;;                                             JuliaDaemon.serve(name="repl")
+;;;
+;;; Topology A survives closing the terminal; B dies with it. Agents reach the
+;;; same session with `jld --id=<id> eval` (captured output, dev's prompt
+;;; untouched), `--scratch` for a throwaway module that can't clobber Main's
+;;; bindings, and `jld transcript` to read what the developer has been doing.
 
 (require "helix/misc.scm")        ; set-status!, set-warning!, set-error!, cursor-position, push-component!, pop-last-component-by-name!
 (require "helix/static.scm")      ; current-selection->string, get-helix-cwd
@@ -12,15 +25,20 @@
 (require "helix/components.scm")  ; new-component!, block/render, buffer/clear, Color/*, style*, frame-set-string!
 
 (require-builtin steel/process)      ; command, with-stdout-piped, with-stderr-piped, spawn-process, child-stdout, child-stderr, wait
-(require-builtin steel/ports)        ; read-port-to-string
-(require-builtin helix/core/text) ; rope-char->byte, rope->byte-slice, rope->string
-(require "steel/result")          ; Ok?, unwrap-ok
+(require-builtin steel/ports)        ; read-port-to-string, open-input-file, read-line-from-port
+(require-builtin steel/meta)         ; maybe-get-env-var
+(require-builtin helix/core/text)    ; rope-char->byte, rope->byte-slice, rope->string
+(require "steel/result")             ; Ok?, unwrap-ok
 
 ;; VTE (terminal emulator) support for rendering ANSI-colored output in the
-;; popup — already installed for this Helix config's own term.scm. Renders
-;; captured stdout/stderr through a real ANSI parser instead of stripping
-;; colors, so Julia's colored errors/values show up as they would in a
-;; terminal.
+;; popup — already installed for this Helix config's own term.scm.
+;;
+;; NOTE (jld port): `jld eval` currently emits *no* ANSI color — the wire
+;; protocol carries a `color` field (daemon.jl:90, read at :622) but only
+;; connect_repl.jl ever sets it true, so the CLI path is always monochrome and
+;; there is no flag to change that. The VTE is kept anyway: it costs nothing,
+;; still does the line-wrapping this popup relies on, and lights up for free if
+;; a `--color` flag lands upstream.
 (#%require-dylib "libsteel_pty"
                  (only-in raw-virtual-terminal
                           vte/resize
@@ -36,62 +54,156 @@
 
 (provide send-to-julia-repl)
 (provide send-top-level-to-julia-repl)
+(provide eval-in-julia)
+(provide eval-top-level-in-julia)
 
-;; ─── Sending code ────────────────────────────────────────────────────────────
+;; ─── Session resolution ──────────────────────────────────────────────────────
+;; Resolves a *name*, not a socket: `jld` already keys a daemon on the project
+;; (the nearest Project.toml walking up from Helix's cwd), so the name only has
+;; to disambiguate several REPLs on one project.
+;;
+;; Every source here is read from the environment or from a file, deliberately.
+;; An earlier version also probed `zellij action current-tab-info` and
+;; `tmux display-message`, mirroring the old quench.sh. That had to go: the
+;; plugin and the REPL probe independently, so one side can succeed while the
+;; other fails, and the two then derive different daemon ids with nothing to
+;; indicate it. That is not hypothetical — it is exactly how this broke in
+;; practice, with the REPL falling back to "repl" while the plugin resolved the
+;; tab name. `zellij action` also needs ZELLIJ_SESSION_NAME and, without it,
+;; prints a session-picker message to *stdout* rather than failing, so a naive
+;; caller parses that as a tab name. And with every tab named "Tab #1" by
+;; default, the probe contributed no disambiguation to pay for the risk.
+;;
+;; "repl" is the default on purpose — it is what JuliaDaemon.serve() picks when
+;; called with no arguments, so a self-serving session needs zero configuration.
+;; Note that a *spawned* daemon's default name is "" (client.jl make_ctx), which
+;; is NOT the same id, so the name is always passed explicitly rather than
+;; omitted.
 
-;; temper resolves the session and passes --sync --eval to juliaclient.
+(define *default-session-name* "repl")
+
+(define (env-or-false name)
+  (define r (maybe-get-env-var name))
+  (if (and (Ok? r) (not (equal? (unwrap-ok r) ""))) (unwrap-ok r) #f))
+
+;; First line of a file, trimmed; #f if unreadable or blank.
+(define (first-line path)
+  (with-handler
+    (lambda (e) #f)
+    (let ([line (read-line-from-port (open-input-file path))])
+      (if (string? line)
+          (let ([t (trim line)]) (if (equal? t "") #f t))
+          #f))))
+
+;; `wait` hands back a Steel Result wrapping the exit status — NOT a bare int
+;; (verified: it prints as `(Ok 0)`), so comparing it to 0 directly is silently
+;; always false. Unwrap it, and treat an Err (process died without a code, e.g.
+;; killed by a signal) as a nonzero exit.
+(define (exit-code proc)
+  (define r (wait proc))
+  (if (Ok? r) (unwrap-ok r) -1))
+
+;; jld sanitizes session names in two different places and at two different
+;; times: `serve_session` (daemon.jl) replaces [^A-Za-z0-9_.-] with "-" and then
+;; hashes the SANITIZED name, while `make_ctx` (client.jl) hashes the name it was
+;; given, raw. A name with a space in it therefore yields two different daemon
+;; ids and the two sides never meet — and Zellij's default tab name is "Tab #1".
+;;
+;; Sanitizing here, before the name is passed to either, makes both hash the same
+;; string. Strict ASCII on purpose: char-alphabetic? would keep "é", which Julia's
+;; [A-Za-z] does not. Verified character-for-character against Julia, multi-byte
+;; input included.
+(define (name-safe-char? c)
+  (define n (char->integer c))
+  (or (and (>= n 48) (<= n 57))                       ; 0-9
+      (and (>= n 65) (<= n 90))                       ; A-Z
+      (and (>= n 97) (<= n 122))                      ; a-z
+      (equal? n 45) (equal? n 46) (equal? n 95)))     ; - . _
+
+(define (sanitize-name s)
+  (list->string (map (lambda (c) (if (name-safe-char? c) c #\-)) (string->list s))))
+
+(define (resolve-session)
+  (sanitize-name (resolve-session-raw)))
+
+(define (resolve-session-raw)
+  (or (env-or-false "MARTENSITE_SESSION")
+      ;; jld's own override, honored so that one variable set in a Zellij/tmux
+      ;; layout names the session on both sides at once — the plugin reads it
+      ;; here, `jld connect` reads it from make_ctx.
+      (env-or-false "JLD_NAME")
+      (first-line ".juliasession")
+      *default-session-name*))
+
+;; ─── jld invocation ──────────────────────────────────────────────────────────
 ;; Both stdout and stderr are piped and captured — Julia writes errors and
-;; stacktraces to stderr, not stdout, and an unpiped stderr is inherited from
-;; Helix's own process: it was writing raw text straight to the terminal,
-;; bypassing the TUI compositor (and this plugin's popup) entirely.
+;; stacktraces to stderr, and an unpiped stderr is inherited from Helix's own
+;; process: it writes raw text straight to the terminal, bypassing the TUI
+;; compositor (and this popup) entirely.
 ;;
 ;; wait->stdout can't be combined with child-stderr: internally it takes the
-;; whole child handle (via Rust's Child::wait_with_output, which reads stdout
-;; AND stderr but only hands back stdout), so by the time it returns there is
-;; no child left to pull stderr from — child-stderr then errors on #false.
-;; Grabbing both port handles before waiting, and waiting separately after,
-;; avoids that.
-(define (run-temper code)
-  (define process
-    (~> (command "temper" (list code))
+;; whole child handle (Rust's Child::wait_with_output, which reads both but
+;; hands back only stdout), so by the time it returns there is no child left to
+;; pull stderr from. Grab both port handles before waiting, wait separately
+;; after.
+;;
+;; No --project is passed: jld's find_project walks *up* from the subprocess
+;; cwd (inherited from Helix), whereas an explicit --project=DIR demands a
+;; Project.toml at exactly that directory and dies otherwise.
+(struct JldResult (code output))
+
+(define (run-jld args)
+  (define proc
+    (~> (command "jld" args)
         with-stdout-piped
         with-stderr-piped
         spawn-process
         unwrap-ok))
-  (define out (read-port-to-string (child-stdout process)))
-  (define err (read-port-to-string (child-stderr process)))
-  (wait process)
-  (string-append out err))
+  (define out (read-port-to-string (child-stdout proc)))
+  (define err (read-port-to-string (child-stderr proc)))
+  (define code (exit-code proc))
+  (JldResult code (string-append out err)))
+
+(define (name-flag) (string-append "--name=" (resolve-session)))
+
+;; Captured eval: output comes back to us, the developer's prompt is never
+;; touched, `ans` is not set. --max-output caps a runaway print loop so it
+;; cannot swamp the popup.
+(define (jld-eval code)
+  (run-jld (list (name-flag) "--max-output=16k" "eval" code)))
+
+;; Paste into the live prompt: bracketed-paste injection into the REPL's tty
+;; buffer (repl_input.jl), so it is echoed at the prompt, evaluated by the REPL
+;; itself and sets `ans`, with any half-typed input stashed and restored.
+;;
+;; The catch, and the one real regression against `temper --sync --print`:
+;; cmd_eval_repl (client.jl:1104) reads back only a `done` frame, so the result
+;; lands in the developer's terminal and never reaches us. Nothing to popup.
+(define (jld-eval-repl code)
+  (run-jld (list (name-flag) "eval-repl" code)))
 
 ;; ─── Output popup ───────────────────────────────────────────────────────────
 ;; A custom component (new-component!) that draws a bordered block, then
-;; renders the captured output through a real VTE (steel-pty's
-;; raw-virtual-terminal) instead of plain fenced markdown text — Julia colors
-;; its errors/values with ANSI SGR codes, and feeding those bytes straight to
-;; the VTE lets it interpret them (and do its own line-wrapping) rather than
-;; needing them stripped or hand-truncated first.
+;; renders captured output through a real VTE (steel-pty's
+;; raw-virtual-terminal) rather than plain fenced markdown, so the VTE does its
+;; own line-wrapping (and would interpret SGR codes if any arrived).
 (struct OutputPopup (vte width height row col))
 
 (define (clamp lo hi v)
   (max lo (min hi v)))
 
-;; Kept small: the original 100x20 cap was routinely larger than the actual
-;; terminal, which is what made the box look like it was "everywhere" — it
-;; wasn't a rendering bug, just an oversized box with nothing there to clip it
-;; further than the (already large) editor area.
 (define *popup-max-width* 60)
 (define *popup-max-height* 10)
 
 ;; The VTE's actual row count — much taller than the popup ever shows, so a
-;; long stacktrace doesn't scroll its own beginning off the top before
-;; render time. See show-output!.
+;; long stacktrace doesn't scroll its own beginning off the top before render
+;; time. See show-output!.
 (define *popup-vte-scrollback-rows* 300)
 
 ;; term/color-attribute converts an opaque TermColorAttribute into (list r g b
-;; a), an indexed-palette int, or #false for "use the theme default". There's
+;; a), an indexed-palette int, or #false for "use the theme default". There is
 ;; no functional "build me an indexed Color" constructor — mirrors steel-pty's
-;; own term.scm, which mutates a scratch Color in place via
-;; set-color-indexed!/set-color-rgb! instead.
+;; own term.scm, which mutates a scratch Color in place instead.
 (define (attr->color attr)
   (cond
     [(list? attr)
@@ -105,17 +217,17 @@
 
 ;; vte/iter-cell-fg and vte/iter-cell-bg return a raw #false — not a
 ;; TermColorAttribute — whenever the iterator has no "last cell" set yet;
-;; term/color-attribute only accepts the opaque TermColorAttribute type, so
-;; it must never be called on that #false.
+;; term/color-attribute only accepts the opaque type, so it must never be
+;; called on that #false.
 (define (cell-color-attr raw)
   (if raw (term/color-attribute raw) #f))
 
-;; Builds a fresh Style per cell rather than reusing/defaulting one: there's
-;; no way to pull a bare Color? back out of theme->fg/theme->bg (they return
-;; a whole Style?, which is what set-style-fg!/set-style-bg! choked on when
-;; used as a fallback color). Leaving fg/bg unset on a Default-attribute cell
-;; instead means "don't touch what's already there" — which is exactly the
-;; block's theme colors that block/render already painted underneath.
+;; Builds a fresh Style per cell rather than reusing/defaulting one: there is
+;; no way to pull a bare Color? back out of theme->fg/theme->bg (they return a
+;; whole Style?, which set-style-fg!/set-style-bg! choke on). Leaving fg/bg
+;; unset on a Default-attribute cell means "don't touch what's already there" —
+;; which is the block's theme colors that block/render already painted
+;; underneath.
 (define (cell-style vte)
   (define s (style))
   (define fg (attr->color (cell-color-attr (vte/iter-cell-fg vte))))
@@ -138,23 +250,22 @@
   ;; doesn't render flush against the border wall.
   (define inner-x (+ 2 x))
   (define inner-y (+ 2 y))
-  ;; Window into the VTE's tall scrollback (see *popup-vte-scrollback-rows*
-  ;; / show-output!): only the rows that actually fit the padded interior.
+  ;; Window into the VTE's tall scrollback: only the rows that fit the padded
+  ;; interior.
   (define visible-rows (- h 4))
   (define vte (OutputPopup-vte state))
   (vte/reset-iterator! vte)
   (let loop ()
     (when (vte/advance-iterator! vte)
-      ;; vte/iter-cell-str, like vte/iter-cell-fg/-bg, returns raw #false
-      ;; (not a string) whenever the iterator has no "last cell" set yet —
-      ;; skip those cells rather than handing #false to frame-set-string!.
+      ;; vte/iter-cell-str, like the fg/bg accessors, returns raw #false
+      ;; whenever the iterator has no "last cell" set yet — skip those rather
+      ;; than handing #false to frame-set-string!.
       (define cell-str (vte/iter-cell-str vte))
       (when (and (string? cell-str) (< (vte/iter-y vte) visible-rows))
         (frame-set-string! frame
-                           ;; vte/iter-x is 1-indexed (first column reports
-                           ;; as 1, not 0) — verified against steel-pty
-                           ;; directly; vte/iter-y is 0-indexed, no
-                           ;; adjustment needed there.
+                           ;; vte/iter-x is 1-indexed (first column reports as
+                           ;; 1, not 0) — verified against steel-pty directly;
+                           ;; vte/iter-y is 0-indexed, no adjustment needed.
                            (+ inner-x (- (vte/iter-x vte) 1))
                            (+ inner-y (vte/iter-y vte))
                            cell-str
@@ -168,41 +279,31 @@
 (define (output-popup-handle-event state event)
   (if (key-event? event) event-result/close event-result/ignore))
 
-;; Show output in a floating, bordered popup fixed at *popup-max-width* x
-;; *popup-max-height* and anchored just below the cursor, or just update the
-;; status bar if empty. The box size is fixed rather than content-derived
-;; (unlike the old markdown-based popup): the VTE does its own line-wrapping
-;; internally, so pre-computing a tight content size for e.g. a long
-;; stacktrace line isn't straightforward — this is a deliberate simplification
-;; over the old truncate-to-fit behavior.
+;; Show output in a floating, bordered popup anchored just below the cursor.
+;; The box size is fixed rather than content-derived: the VTE does its own
+;; line-wrapping internally, so pre-computing a tight content size for e.g. a
+;; long stacktrace line isn't straightforward.
 (define (show-output! output)
   ;; Replace any popup from a still-open previous call rather than stacking a
-  ;; new one on top of it (e.g. two send-to-julia-repl calls with no dismiss
-  ;; keypress in between).
+  ;; new one on top of it.
   (pop-last-component-by-name! "martensite-output")
   (define box-width *popup-max-width*)
   (define box-height *popup-max-height*)
   (define vte (raw-virtual-terminal))
-  ;; Rows: far taller than the popup ever shows (*popup-vte-scrollback-rows*),
-  ;; windowed down to the visible rows in output-popup-render. A long Julia
-  ;; stacktrace is many more lines than the popup's visible height, and a VTE
-  ;; sized to exactly the visible rows scrolls like a real terminal as it's
-  ;; fed — showing only the *tail* of the trace (deep internal frames) and
-  ;; cutting off the actual "ERROR: ..." message and the user's own frames at
-  ;; the top, which is the useful part.
+  ;; Rows: far taller than the popup ever shows, windowed down to the visible
+  ;; rows in output-popup-render. A VTE sized to exactly the visible rows
+  ;; scrolls like a real terminal as it is fed — showing only the *tail* of a
+  ;; long stacktrace and cutting off the "ERROR: ..." message at the top, which
+  ;; is the useful part.
   ;;
-  ;; Cols: -4, not -2: border (2) + padding (2), matching
-  ;; output-popup-render's inner-x/inner-y inset — otherwise the VTE wraps
-  ;; content wider than the padded interior actually has room for.
+  ;; Cols: -4, not -2: border (2) + padding (2), matching inner-x/inner-y —
+  ;; otherwise the VTE wraps wider than the padded interior has room for.
   (vte/resize vte *popup-vte-scrollback-rows* (- box-width 4))
-  ;; The captured output is piped (not a real pty), so it's plain Unix text
-  ;; with bare \n — no kernel tty driver is present to translate that to
-  ;; \r\n. This VTE is a faithful raw terminal emulator, so \n alone is just
-  ;; a linefeed (moves down a row) and does NOT return the cursor to column
-  ;; 0 the way a real terminal's ICRNL/ONLCR settings would; without this,
-  ;; every line after the first starts wherever the previous line's cursor
-  ;; ended up, staircasing further right each line. Verified directly
-  ;; against steel-pty outside of Helix before landing this fix.
+  ;; The captured output is piped (not a real pty), so it is plain Unix text
+  ;; with bare \n — no kernel tty driver is present to translate that to \r\n.
+  ;; This VTE is a faithful raw terminal emulator, so \n alone is just a
+  ;; linefeed and does NOT return the cursor to column 0; without this, every
+  ;; line after the first staircases further right.
   (vte/advance-bytes vte (string-replace output "\n" "\r\n"))
   (define cursor (car (current-cursor)))
   (define anchor-row (if cursor (+ 1 (position-row cursor)) 0))
@@ -214,44 +315,67 @@
                     (hash "handle_event" output-popup-handle-event)))
   (push-component! popup))
 
-;; Runs on the background thread spawned by send-code! — split out so
-;; with-handler below wraps a single call, not a multi-expression body whose
-;; interaction with internal defines under with-handler isn't something I've
-;; verified.
-(define (send-code-inner! code)
-  (define output (run-temper code))
-  (hx.with-context
-    (lambda ()
-      (if (equal? output "")
-          (set-status! "martensite: done (no output)")
-          (show-output! output)))))
+;; ─── Dispatch ────────────────────────────────────────────────────────────────
 
-;; Send code string via temper and display output. Errors on the background
-;; thread (e.g. in run-temper or show-output!) otherwise vanish silently —
-;; spawn-native-thread has no visible failure path — so this surfaces
-;; whatever goes wrong via set-error! instead of guessing blind.
-(define (send-code! code)
+;; Collapse a multi-line message into something the one-row status bar can show.
+(define (one-line text)
+  (define t (trim text))
+  (if (equal? t "")
+      "jld failed with no output"
+      (trim (car (split-many t "\n")))))
+
+(define (report! result status)
+  (set-status! status)
+  (unless (equal? (JldResult-output result) "")
+    (show-output! (JldResult-output result))))
+
+;; The two modes are deliberately not interchangeable, and neither falls back to
+;; the other:
+;;
+;;   'repl — jld eval-repl. The REPL evaluates, so the result lands in the
+;;           developer's terminal and `ans` is set. The socket only acknowledges
+;;           the paste, so there is nothing here to show.
+;;   'eval — jld eval. We evaluate, so the result comes back and lands in the
+;;           popup, and the prompt is never touched.
+;;
+;; An earlier version silently retried a failed paste as a captured eval. That
+;; blurred the one distinction the two commands exist to express — pick the
+;; command that matches where you want the answer, and a missing REPL is an
+;; error to fix rather than a mode to switch into.
+(define (send-code-inner! code mode)
+  (cond
+    [(equal? mode 'eval)
+     (define result (jld-eval code))
+     (hx.with-context (lambda () (report! result "martensite: evaluated")))]
+    [else
+     (define result (jld-eval-repl code))
+     (hx.with-context
+       (lambda ()
+         (if (equal? (JldResult-code result) 0)
+             (set-status! "martensite: sent to REPL")
+             ;; jld's own message is already specific and actionable ("no REPL
+             ;; attached to <id>; start one with `jld connect`"), so pass it
+             ;; through rather than inventing a vaguer one. Flattened to a
+             ;; single line for the status bar.
+             (set-error! (string-append "martensite: " (one-line (JldResult-output result)))))))]))
+
+;; Errors on the background thread otherwise vanish silently —
+;; spawn-native-thread has no visible failure path — so surface whatever goes
+;; wrong via set-error! instead of guessing blind.
+(define (send-code! code mode)
   (spawn-native-thread
     (lambda ()
       (with-handler
         (lambda (e)
           (define msg (call-with-output-string (lambda (port) (display e port))))
           (hx.with-context (lambda () (set-error! (string-append "martensite error: " msg)))))
-        (send-code-inner! code))))
+        (send-code-inner! code mode))))
   (set-status! "martensite: sending…"))
 
-;; ─── Main commands ───────────────────────────────────────────────────────────
+;; ─── Code extraction ─────────────────────────────────────────────────────────
 
-;;@doc
-;; Send the current selection to the running DaemonicCabal.jl server.
-;; On failure, copies a server startup command to the clipboard.
-(define (send-to-julia-repl)
-  (define code (string-join (register->value #\.) "\n"))
-  (cond
-    [(or (not code) (equal? code ""))
-     (set-warning! "martensite: nothing selected")]
-    [else
-     (send-code! code)]))
+(define (selection-code)
+  (string-join (register->value #\.) "\n"))
 
 ;; Walk up the tree-sitter tree until we reach a direct child of the root.
 (define (find-top-level-node node)
@@ -261,32 +385,61 @@
     [(not (tsnode-parent parent)) node]
     [else (find-top-level-node parent)]))
 
-;;@doc
-;; Send the top-level tree-sitter form under the cursor to the running
-;; DaemonicCabal.jl server. On failure, copies a startup command to the clipboard.
-(define (send-top-level-to-julia-repl)
+;; Returns the top-level form's text, or a (cons 'warn message) to report.
+(define (top-level-code)
   (define doc-id (editor->doc-id (editor-focus)))
   (define tree (document->tree doc-id))
   (cond
-    [(not tree)
-     (set-warning! "martensite: no tree-sitter tree for this buffer")]
+    [(not tree) (cons 'warn "martensite: no tree-sitter tree for this buffer")]
     [else
      (define rope (editor->text doc-id))
-     (define cursor-char (cursor-position))
-     (define cursor-byte (rope-char->byte rope cursor-char))
-     (define root (tstree->root tree))
+     (define cursor-byte (rope-char->byte rope (cursor-position)))
      (define node-at-cursor
-       (tsnode-named-descendant-byte-range root cursor-byte cursor-byte))
+       (tsnode-named-descendant-byte-range (tstree->root tree) cursor-byte cursor-byte))
      (cond
-       [(not node-at-cursor)
-        (set-warning! "martensite: no node at cursor")]
+       [(not node-at-cursor) (cons 'warn "martensite: no node at cursor")]
        [else
         (define top-node (find-top-level-node node-at-cursor))
-        (define start-byte (tsnode-start-byte top-node))
-        (define end-byte (tsnode-end-byte top-node))
-        (define code (rope->string (rope->byte-slice rope start-byte end-byte)))
-        (cond
-          [(or (not code) (equal? code ""))
-           (set-warning! "martensite: top-level node is empty")]
-          [else
-           (send-code! code)])])]))
+        (rope->string (rope->byte-slice rope
+                                        (tsnode-start-byte top-node)
+                                        (tsnode-end-byte top-node)))])]))
+
+(define (dispatch-selection! mode)
+  (define code (selection-code))
+  (if (or (not code) (equal? code ""))
+      (set-warning! "martensite: nothing selected")
+      (send-code! code mode)))
+
+(define (dispatch-top-level! mode)
+  (define code (top-level-code))
+  (cond
+    [(pair? code) (set-warning! (cdr code))]
+    [(or (not code) (equal? code "")) (set-warning! "martensite: top-level node is empty")]
+    [else (send-code! code mode)]))
+
+;; ─── Commands ────────────────────────────────────────────────────────────────
+
+;;@doc
+;; Paste the current selection into the live Julia REPL, as if typed there:
+;; echoed at the prompt, `ans` set, result shown in the developer's terminal.
+;; Falls back to a captured eval (result in a popup) if no REPL is attached.
+(define (send-to-julia-repl)
+  (dispatch-selection! 'repl))
+
+;;@doc
+;; Paste the top-level tree-sitter form under the cursor into the live Julia
+;; REPL, as if typed there.
+(define (send-top-level-to-julia-repl)
+  (dispatch-top-level! 'repl))
+
+;;@doc
+;; Evaluate the current selection in the Julia session without touching the
+;; REPL prompt; the result is shown in a popup.
+(define (eval-in-julia)
+  (dispatch-selection! 'eval))
+
+;;@doc
+;; Evaluate the top-level tree-sitter form under the cursor without touching
+;; the REPL prompt; the result is shown in a popup.
+(define (eval-top-level-in-julia)
+  (dispatch-top-level! 'eval))

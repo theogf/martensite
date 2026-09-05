@@ -1,93 +1,200 @@
 # martensite
 
-Steel plugin for Helix that sends Julia code to a DaemonicCabal.jl session.
+Steel plugin for Helix that sends Julia code to a live REPL served by
+[JuliaDaemon.jl](https://github.com/KristofferC/JuliaDaemon.jl) (`jld`).
+
+The plugin is the whole product: `martensite.scm` is the only code in this repo.
+There is no daemon, no binary, no service unit, and no install script — the
+installation is `Pkg.app add` for `jld` plus one `(require ...)` line in Helix's
+`init.scm`.
+
+> Until 2026-09, this repo also carried a Rust rewrite of DaemonicCabal.jl's
+> `julia-conductor`/`juliaclient` (a worker-pool daemon, a systemd unit, an
+> `install.sh`, and a `DaemonWorker` Julia package copied out of a checkout).
+> All of it was deleted in favour of `jld`. Anything referring to a conductor,
+> a worker pool, `quench`/`temper` as installed scripts, or the `JULIA_DAEMON_*`
+> environment variables is describing code that no longer exists — check
+> `git log` before `7f68c6c` if you need it.
 
 ## Steel/Helix API Reference
 
 When looking up Steel or Helix plugin APIs, refer to:
 https://github.com/mattwparas/helix/blob/steel-event-system/STEEL.md
 
-## Rust binaries
+Steel's own primitives are easiest to look up in the vendored git db, which
+holds the exact revision Helix was built against:
 
-This repo contains a Cargo workspace with Rust rewrites of the Zig `julia-conductor` and `juliaclient` binaries originally from `~/.julia/dev/DaemonicCabal/`.
-
-```
-cargo build                        # builds both binaries
-target/debug/julia-conductor       # conductor daemon
-target/debug/juliaclient           # client (drop-in for `julia`)
+```sh
+cd ~/.cargo/git/db/steel-*/ && git grep -n 'name = "split-once"' $(git rev-list --all -1)
 ```
 
-### Structure
+`jld`'s source is likewise readable at `~/.julia/packages/JuliaDaemon/*/src/`.
 
-| Crate | Binary | Role |
-|-------|--------|------|
-| `conductor/` | `julia-conductor` | Worker pool daemon — accepts client connections, spawns Julia workers, routes stdio |
-| `client/` | `juliaclient` | Client — connects to conductor, proxies stdin/stdout/stderr/signals to assigned worker |
+## Architecture
 
-### Protocol compatibility
+Two paths reach the same `Main`; they differ in who evaluates the code, and so
+in where the result comes out.
 
-Wire format is identical to the Zig implementation:
+| Commands | Runs | Result appears | `ans` |
+|---|---|---|---|
+| `send-to-julia-repl`, `send-top-level-to-julia-repl` | `jld eval-repl` | the developer's terminal | set |
+| `eval-in-julia`, `eval-top-level-in-julia` | `jld eval` | Helix popup | not set |
 
-- `CLIENT_MAGIC = 0x4A444301` ("JDC\x01")
-- `WORKER_MAGIC = 0x4A445701` ("JDW\x01")
-- `NOTIFICATION_MAGIC = 0x4A444E01` ("JDN\x01")
-- All integers little-endian, strings length-prefixed with u16
+**Neither mode falls back to the other.** An early version retried a failed
+paste as a captured eval; that blurred the single distinction the two commands
+exist to express. With no REPL attached, `send-*` surfaces `jld`'s own error
+(`no REPL attached to <id>; start one with jld connect`) and stops.
 
-The Rust binaries track DaemonicCabal.jl 0.5.0's wire protocol, including the additions from that release: `query_clients`/`clients`/`drop_session` worker messages, the `client_interrupt` notification, and the `executing` signal.
+`jld eval` returns exactly what a REPL would show — streamed stdout/stderr plus
+the rendered value, honoring `nothing` and a trailing `;` — so the popup path
+needs nothing upstream.
 
-### Key env vars (conductor)
+`eval-repl` is a genuine paste: `JuliaDaemon/src/repl_input.jl` writes the code
+into the REPL's `stdin` buffer wrapped in bracketed-paste markers, so LineEdit
+cannot tell it from a terminal paste — echoed, evaluated by the REPL, prompt
+redrawn, with any half-typed input stashed and restored around it.
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `JULIA_DAEMON_WORKER_PROJECT` | `~/.local/share/julia-daemon/worker` | Julia project/environment for workers |
-| `JULIA_DAEMON_SERVER` | `<runtime_dir>/conductor.sock` | Socket path or `tcp://host:port` |
-| `JULIA_DAEMON_RUNTIME` | `/run/user/$UID/julia-daemon` | Runtime directory |
-| `JULIA_DAEMON_WORKER_EXECUTABLE` | `julia` | Julia binary |
-| `JULIA_DAEMON_WORKER_MAXCLIENTS` | `1` | Max clients per worker |
-| `JULIA_DAEMON_MIN_TTL` | `120` | Idle floor (seconds): a worker younger than this is never pressure-evicted |
-| `JULIA_DAEMON_MAX_TTL` | `7200` | Idle ceiling (seconds): always culled once idle past this, pressure or not. Supersedes the old `JULIA_DAEMON_WORKER_TTL`, which is still read as its fallback default |
-| `JULIA_DAEMON_MEMORY_PRESSURE` | `1` | Master switch for pressure-reactive eviction; `0` disables it (flat MIN/MAX_TTL culling still applies) |
-| `JULIA_DAEMON_PSI_THRESHOLD` | `10.0` | PSI `some avg10` percent that counts as pressure, when `/proc/pressure/memory` is available |
-| `JULIA_DAEMON_MEMFREE_LOW` / `_HIGH` | `10%` / `15%` | Free-memory enter/exit thresholds (fraction of total, or bytes with a `K`/`M`/`G` suffix), used as a fallback when PSI isn't available |
+### `jld connect` has two prompts, and pastes follow the active one
 
-The actual idle budget a given worker gets is adaptive, not a flat MIN/MAX_TTL cutoff — see `idle_budget` in `conductor/src/conductor.rs` and the recency/frequency + occupancy tracking in `conductor/src/worker.rs` (`Crf`, `Ewma`).
+Verified by pasting `getpid()` in each: at `julia@<id>>` it reaches the daemon;
+after a backspace to the plain `julia>` the identical paste evaluates in the
+connect script's *own* local Julia (a different pid, no project, no Revise).
 
-### Installation
+martensite cannot detect or fix this — `repl.sock` injects into the tty buffer
+and has no mode awareness. `>` at the empty `julia>` returns to the daemon mode
+(`install_mode`'s `enter_key` in `connect_repl.jl`, merged into the main mode
+like `]`/`?`/`;`). Topology B (`JuliaDaemon.serve()`) has no such split and is
+immune.
 
-```bash
-./install.sh            # build release, install service + symlinks
-./install.sh uninstall  # remove everything
+If a user reports "sends go somewhere wrong" or "UndefVarError for things that
+are definitely loaded", check which prompt they are sitting at first.
+
+### Session identity
+
+A daemon is keyed on **project + name**. `jld` derives the project itself by
+walking up from the subprocess cwd (inherited from Helix); the plugin supplies
+only the name, resolved by `resolve-session`:
+
+`MARTENSITE_SESSION` → `JLD_NAME` → `.juliasession` first line → `"repl"`.
+
+**Every source is an env var or a file, never a probe.** A Zellij/tmux tab-name
+probe used to sit in this cascade and was removed: the plugin and the REPL
+resolve independently, so a probe succeeding on one side and failing on the
+other yields two daemon ids and no error. `zellij action` needs
+`ZELLIJ_SESSION_NAME` and otherwise prints a session-picker message to *stdout*
+rather than failing, which a caller parses as a tab name. It bought nothing
+either — unnamed tabs are all `Tab #1`, so it never disambiguated anything.
+
+Two things that are easy to get wrong here:
+
+- **`"repl"` is the fallback for a reason** — it is what `JuliaDaemon.serve()`
+  picks with no arguments. A *spawned* daemon's default name is the empty
+  string (`client.jl` `make_ctx`), which is a **different id**. So the name is
+  always passed explicitly on both sides rather than omitted.
+- **Do not pass `--project` to `jld`.** Its `find_project` walks *up* from the
+  cwd, whereas an explicit `--project=DIR` demands a `Project.toml` at exactly
+  that directory and `die`s otherwise.
+- **But DO pass `--project=@.` to `julia`** when starting a self-serving
+  session. `jld` walks up to the nearest `Project.toml`; plain `julia` does
+  not, and defaults to `@v#.#`. Without it the session registers as
+  `v1.12-<name>-<hash>` while the plugin computes `<project>-<name>-<hash>`,
+  and the two never meet — the failure looks like "no REPL attached" plus a
+  second daemon quietly autostarting.
+- **Sanitize the session name before passing it anywhere.** `jld` cleans names
+  in one of two code paths only: `serve_session` replaces `[^A-Za-z0-9_.-]` with
+  `-` and hashes the *sanitized* name, while `make_ctx` hashes what it was
+  given, raw. So `Tab #1` yields `martensite-Tab--1-4a1dabfa` from a serving
+  REPL and `martensite-Tab #1-e9dd730d` from the CLI — two daemons that never
+  meet. `sanitize-name` does this up front; it is strict ASCII on purpose
+  (`char-alphabetic?` would keep `é`, which Julia's `[A-Za-z]` does not).
+  Zellij's default tab name is exactly this shape, so it is not a corner case.
+- **`JuliaDaemon` is not importable from a normal REPL.** `Pkg.app add` puts it
+  in `~/.julia/environments/apps/JuliaDaemon`, off the default load path.
+  Appending that env to `JULIA_LOAD_PATH` makes it importable without adding it
+  to any environment. `isinteractive()` is already true during `-e` under `-i`,
+  so `serve()` from `-e` does register the paste socket.
+
+## `quench`
+
+`quench` is a POSIX `sh` script in the repo root that starts a plain Julia REPL
+serving itself as a jld session. It is a script, not a shell function, because a
+Zellij/tmux layout names it as the pane `command` and execs it directly. It is
+not installed anywhere — layouts reference it by path in the checkout.
+
+Its name cascade must stay identical to `resolve-session` in `martensite.scm`,
+sanitizer included (`tr -c 'A-Za-z0-9_.-' '-'` there, `sanitize-name` here). If
+you change one, change the other: the whole point is that both sides derive the
+same daemon id without talking to each other.
+
+## Steel gotchas
+
+Both of these were found by running the code, not by reading it — see Testing.
+
+- **`wait` returns a `Result`, not an integer.** It prints as `(Ok 0)`.
+  Comparing it to `0` directly is silently always false; unwrap via `Ok?` /
+  `unwrap-ok` (`exit-code` in `martensite.scm` does this).
+- **`zellij action current-tab-info` prints several `key: value` lines**
+  (`name:`, `id:`, `position:`, ...). Take the first line *before* splitting on
+  `": "`, or the tab name comes back with the rest of the report attached.
+- **Piped output is not a pty**, so it carries bare `\n`. The popup's VTE is a
+  faithful raw terminal emulator: `\n` is a linefeed only, and without rewriting
+  to `\r\n` every line staircases further right.
+- **Grab both child port handles before `wait`ing.** `wait->stdout` consumes
+  the whole child handle internally, leaving nothing to pull stderr from.
+  Piping stderr is mandatory — Julia writes errors there, and an unpiped stderr
+  is inherited from Helix and writes straight past the TUI compositor.
+
+## Testing
+
+There is no test suite; the plugin is exercised directly. Two techniques cover
+almost everything without launching Helix:
+
+**Run the non-Helix half under the `steel` CLI.** The session-resolution and
+`jld` layers require only `steel/process`, `steel/ports`, `steel/meta`,
+`steel/filesystem` and `steel/result` — none of the `helix/*` modules — so they
+can be sliced out and executed standalone:
+
+```sh
+sed -n '/^;; ─── Session resolution/,/^;; ─── Output popup/p' martensite.scm > /tmp/body.scm
+# prepend the five require-builtins, append some displayln calls, then:
+steel /tmp/probe.scm
 ```
 
-What it does:
-1. `cargo build --release`
-2. Copies `worker/` from `$DAEMONIC_CABAL_SRC` (default `~/.julia/dev/DaemonicCabal`) to `~/.local/share/julia-daemon/worker` — this is `DaemonWorker`, a self-contained Julia package (stdlib deps only) that isn't a registered package, so it can't be `Pkg.add`ed; it has to be copied from a DaemonicCabal.jl checkout, exactly like DaemonicCabal.jl's own installer does (`src/installers/common.jl`)
-3. Copies binaries to `~/.local/share/julia-daemon/`
-4. Writes `~/.config/systemd/user/julia-daemon.service` (with `JULIA_DAEMON_WORKER_PROJECT=~/.local/share/julia-daemon/worker`) and enables it
-5. Symlinks `juliaclient` → `~/.local/bin/juliaclient`
-6. Copies `quench.sh`/`temper.sh` → `~/.local/bin/quench`/`~/.local/bin/temper`
+**Drive a real REPL under a pty** to exercise the paste path end to end. `jld
+connect` needs a tty, and `serve_input` only runs when `isinteractive()`:
 
-### DaemonicCabal patches
-
-As of DaemonicCabal.jl 0.5.0, the previously-required local patch is upstream and no longer needs manual reapplication:
-
-**`dup: Bad file descriptor` on REPL exit** — on Julia < 1.11, `redirect_stdio` cleanup calls `dup` on a file descriptor that is already closed when the client disconnects. Upstream now carries the guard itself (`worker/src/setup.jl`, inside the `teardown_client` cleanup):
-
-```julia
-catch err
-    err isa Base.SystemError && occursin("dup", err.msg) && return
-    isopen(client_stdout) && rethrow()
-end
+```sh
+mkfifo /tmp/in; (sleep 90 > /tmp/in) &          # holds stdin open
+script -qfc "jld connect --name=<session>" /tmp/repl.log < /tmp/in &
+jld --name=<session> eval-repl '6*7'            # expect exit 0
+sed -e 's/\x1b\[[0-9;?]*[a-zA-Z]//g' -e 's/\r/\n/g' /tmp/repl.log   # expect 42
 ```
 
-If `~/.julia/dev/DaemonicCabal` still has an uncommitted local copy of this patch from before the 0.5.0 upgrade, it's safe to drop — just confirm the checkout is actually on 0.5.0+ first.
+Clean up afterwards: `jld --id=<id> stop` for anything spawned, then `jld gc`.
+Never `jld kill` a session that is a human's live REPL.
 
-### Design notes
+`test.jl` is a manual fixture for the popup — it ends in `error("oh no")` so a
+send exercises stacktrace rendering.
 
-- **No async runtime** — synchronous I/O matches the Zig single-threaded model and keeps `fork()` safe for sandbox spawning.
-- **Conductor** uses a `select()`-based accept loop, with background threads for periodic ping health checks, min/max-TTL idle culling, and (when a pressure source is detected) memory-pressure eviction. Worker teardown is staged (`soft_exit` → grace → `SIGTERM` → grace → `SIGKILL`), tracked in a pending-kill list swept by those same timers rather than killed in place.
-- **Idle budget** is adaptive per worker, not a flat TTL: a recency/frequency score per pool key (`Crf`, an LRFU-style value plus a Jacobson/RFC6298 inter-summon interval estimate) combines with a decayed busy-fraction estimate per worker (`Ewma`) to size how long it's worth keeping a given worker around — see `Conductor::idle_budget`.
-- **`--threads`/`-t` is part of a worker's pool identity** — Julia fixes thread counts at process startup, so a worker spawned with a different `--threads` spec can't be reused for a request wanting a different one (same treatment as a project or Julia-channel mismatch).
-- **`--status`/`--status=live`** renders a tree of workers/clients/pressure state from the conductor's own in-memory data (no worker-protocol round trip). Live mode redraws in place from a background thread that re-locks the conductor briefly per frame, so it never blocks the main accept loop; teardown is notification-driven (`client_exit`/`client_interrupt`), not a bespoke keypress handler. Unlike upstream, this port renders with flat ANSI colors rather than an OSC-probed truecolor palette — a deliberate scope cut, not a compatibility gap.
-- **Client** uses `epoll` (Linux) or `poll` (fallback) to multiplex stdin/stdout/stderr/signals. `Ctrl-C` is delivered as a literal `\x03` on stdin when the worker is at a raw prompt, or as a `client_interrupt` notification (conductor sends the worker process `SIGINT` directly) when mid-eval — gated by the worker's `executing` signal.
-- **Sandbox** (Linux only) uses unprivileged user namespaces (`unshare`/`pivot_root`/bind mounts) via raw `libc` syscalls — no root required.
+## Upstream gaps
+
+One, in JuliaDaemon.jl, worked around in `martensite.scm` rather than patched
+locally. Filed as
+[KristofferC/JuliaDaemon.jl#5](https://github.com/KristofferC/JuliaDaemon.jl/issues/5).
+
+(`eval-repl` also never returns the evaluated result — `serve_input`
+acknowledges as soon as the bytes are in the tty buffer, and `cmd_eval_repl`
+reads only that `done` frame. This is deliberately *not* treated as a gap: it
+is what makes the paste mode the paste mode. Don't build on the transcript to
+work around it — that races the evaluation, and a session daemon records inputs
+with empty output anyway.)
+
+1. **`jld eval` output is always monochrome.** The request struct has a
+   `color::Bool` field (`daemon.jl`), parsed from the request and threaded into
+   both `render` and `format_error` as `IOContext(:color => ...)` — but only
+   `connect_repl.jl` ever sets it true, and the CLI has no flag. The daemon side
+   is complete; only a client flag is missing.
+
+The popup's VTE machinery is kept despite this: it costs nothing, still does the
+line-wrapping the popup relies on, and would light up for free if a `--color`
+flag lands.

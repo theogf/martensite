@@ -4,10 +4,10 @@
 
 > *Martensite* is the hardest phase of steel, formed by rapidly quenching austenite — a metaphor for JIT-compiled Julia hardened through the Steel scripting layer.
 
-A [Steel](https://github.com/mattwparas/steel) plugin for [Helix](https://helix-editor.com) that sends Julia code to a running [DaemonicCabal.jl](https://github.com/tecosaur/DaemonicCabal.jl) session.
+A [Steel](https://github.com/mattwparas/steel) plugin for [Helix](https://helix-editor.com) that sends Julia code to a live REPL served by [JuliaDaemon.jl](https://github.com/KristofferC/JuliaDaemon.jl).
 
-> [!WARNING]
-> Getting this setup requires advanced knowledge in git and linux setup
+The whole plugin is one file, `martensite.scm`. There is no daemon to install, no
+systemd unit, no binary to build, and no install script to run.
 
 ## Prerequisites
 
@@ -21,30 +21,63 @@ Follow the instructions [here](https://github.com/mattwparas/helix/blob/steel-ev
 > export HELIX_RUNTIME=/path/to/helix/runtime
 > ```
 
-### 2. DaemonicCabal.jl and Rust conductor/client
-
-The mechanism relies on the `DaemonWorker` module built in `DaemonicCabal.jl`.
-This repo also ships Rust rewrites of the [DaemonicCabal](https://github.com/tecosaur/DaemonicCabal.jl) conductor and client binaries, derived directly from the Zig implementation and wire-compatible with the Julia worker. Build and install them with:
+### 2. `jld`
 
 ```sh
-./install.sh
+julia -e 'using Pkg; Pkg.app add url="https://github.com/KristofferC/JuliaDaemon.jl"'
 ```
 
-This builds the binaries, installs the systemd user service, and symlinks `juliaclient` and `quench` to `~/.local/bin/`.
+That installs `jld` into `~/.julia/bin`. Put it on your `PATH` (`jld install`
+will symlink it into `~/.local/bin` if it isn't already).
 
-See [CLAUDE.md](CLAUDE.md) for details on the Rust binaries and protocol.
+### 3. A Julia session named from context
 
-### 3. Starting a Julia session
+The repo ships `quench`: a dependency-free POSIX `sh` script that starts a plain
+Julia REPL which serves *itself* as a jld session. One process, one prompt, and
+its state dies with the terminal.
 
-Use the provided `quench` script, which resolves the session name automatically (see [Session resolution](#session-resolution)):
+There is nothing to install. Point your Zellij/Tmux layout at it where it sits:
+
+```kdl
+pane {
+    command "/path/to/martensite/quench"
+    name "Julia"
+}
+```
+
+Naming it as the pane command directly is why it is a script rather than a shell
+function — a layout execs the command instead of going through a shell. Run it
+by hand the same way, and pass any extra Julia flags straight through:
 
 ```sh
-quench
+/path/to/martensite/quench --threads=auto
 ```
 
-you can pass all the usual julia flags.
+Symlink it onto your `PATH` if you would rather type `quench`, but nothing
+requires it.
 
-Set this as the command for your Julia pane in your Zellij/Tmux layout.
+<details>
+<summary>Alternative: <code>jld connect</code>, if you want state that outlives the terminal</summary>
+
+`jld connect --name=<session>` puts `Main` in a daemon instead, so closing and
+reattaching **resumes the previous session's state**.
+
+> [!WARNING]
+> That form gives you two prompts, and sends follow whichever is active.
+> Backspace at an empty `julia@<id>>` prompt drops you to a plain `julia>` —
+> the connect script's *own* local Julia, with no project, no Revise and none
+> of your packages. A send pasted there evaluates in that process instead of
+> your session, silently and wrongly.
+>
+> **Press `>` at the empty `julia>` prompt to get back.** It is a mode key like
+> `]`, `?` and `;`; the connect banner mentions how to leave but not how to
+> return.
+</details>
+
+The `eval-*` commands work whether or not a REPL is running — with none, `jld`
+starts a daemon on the first send. The `send-*` commands need one by definition:
+with none, they report `jld`'s own error rather than quietly evaluating
+somewhere you weren't looking.
 
 ## Installation
 
@@ -54,14 +87,16 @@ Require the plugin from your Helix `init.scm` (`~/.config/helix/init.scm`):
 (require "/path/to/martensite/martensite.scm")
 ```
 
+That's the whole installation.
+
 ## Usage
 
-Two commands are available:
-
-| Command | Description |
-|---|---|
-| `send-to-julia-repl` | Send the last-yanked text (`"` register) to the session |
-| `send-top-level-to-julia-repl` | Send the top-level tree-sitter form under the cursor |
+| Command | Sends | Result appears |
+|---|---|---|
+| `send-to-julia-repl` | last-yanked text (`.` register) | in your REPL, at the prompt, `ans` set |
+| `send-top-level-to-julia-repl` | top-level tree-sitter form under the cursor | in your REPL, at the prompt, `ans` set |
+| `eval-in-julia` | last-yanked text | in a popup; your prompt is untouched |
+| `eval-top-level-in-julia` | top-level form under the cursor | in a popup; your prompt is untouched |
 
 Bind them in `~/.config/helix/config.toml`:
 
@@ -69,6 +104,7 @@ Bind them in `~/.config/helix/config.toml`:
 [keys.normal]
 C-j = ":send-to-julia-repl"
 C-S-j = ":send-top-level-to-julia-repl"
+A-j = ":eval-in-julia"
 
 [keys.select]
 C-j = ":send-to-julia-repl"
@@ -78,15 +114,62 @@ C-j = ":send-to-julia-repl"
 - `send-to-julia-repl` — yank the code you want to send (`y`), then press `C-j`
 - `send-top-level-to-julia-repl` — place the cursor anywhere inside a function/block and press `C-S-j`; it walks the tree-sitter parse tree up to the top-level node and sends it automatically
 
-Output from the Julia session is shown in a floating popup (dismiss with any keypress).
+The two pairs are not interchangeable, and neither falls back to the other —
+pick the one that matches where you want the answer.
+
+The `send-*` pair is a real paste into the prompt: bracketed-paste injection, so
+the code is echoed, evaluated by the REPL itself, and sets `ans` — and any
+half-typed input of yours is stashed and put back afterwards. Because the REPL
+owns the evaluation, its output goes to your terminal, not back to Helix.
+
+The `eval-*` pair is the opposite trade: `jld` evaluates and hands back exactly
+what a REPL would show — streamed output plus the rendered value, with the usual
+semantics (`nothing` and a trailing `;` print nothing) — which lands in a
+floating popup (dismiss with any keypress). Your prompt is never touched, and
+`ans` is not set.
 
 ## Session resolution
 
-Both the Helix plugin and `quench`/`temper` resolve the session name using the same cascade:
+`jld` keys a daemon on the *project* — the nearest `Project.toml` walking up
+from Helix's working directory — so the session name only has to disambiguate
+several sessions on one project. The plugin resolves it as:
 
-1. **`.juliasession` file** — if a `.juliasession` file exists in the project root, its first line is used as the session name.
-2. **Zellij tab name** — if running inside Zellij, the current tab name is used.
-3. **Tmux window name** — if running inside tmux, the current window name is used.
-4. **Working directory** — fallback to the CWD of the Helix process.
+1. **`MARTENSITE_SESSION`** environment variable, if set.
+2. **`JLD_NAME`** — `jld`'s own override, honored here too so that one variable
+   set per-pane in a layout names the session on both sides at once.
+3. **`.juliasession` file** — its first line, if the file exists in the project root.
+4. **`repl`** — the default, which is also what `JuliaDaemon.serve()` picks with
+   no arguments.
 
-Name your Zellij tabs or tmux windows meaningfully and both sides will find each other automatically.
+Most of the time you need none of these: one REPL per project resolves to `repl`
+on both sides and just works. Reach for `.juliasession` (or `JLD_NAME`) only to
+run *several* REPLs against one project.
+
+> [!NOTE]
+> Earlier versions also probed the Zellij tab name and the tmux window name.
+> That was removed. The plugin and the REPL resolve the name independently, so a
+> probe that works on one side and fails on the other produces two different
+> daemon ids with nothing to show for it — which is exactly how it broke in
+> practice. `zellij action` also requires `ZELLIJ_SESSION_NAME` and, without it,
+> prints a session-picker message to stdout instead of failing, so the caller
+> parses that as a tab name. Every source above is an environment variable or a
+> file, and cannot half-work.
+
+## Agents
+
+Agents share the session without touching your prompt. A `quench` session shows
+up in `jld list` with state **`idle/repl`**, which is how an agent recognises a
+human's live REPL rather than a daemon it may restart or stop. Given its id:
+
+```sh
+jld --id=<id> eval '<code>'      # captured output; your prompt is untouched
+jld --id=<id> eval --scratch ... # throwaway module that can't clobber Main's bindings
+jld --id=<id> transcript         # read what you have been doing
+```
+
+`jld install` drops an agent skill into `~/.agents/skills` (and the skills
+directories of installed agents — `~/.claude`, `~/.codex`) documenting exactly
+this: spot `idle/repl`, read `jld transcript` first for context, eval into the
+session, show results with `jld eval-repl`, and never `jld kill` a human's REPL
+(`jld stop` refuses it automatically). So agents do not need to be told any of
+this per-project — it travels with `jld`, not with martensite.
