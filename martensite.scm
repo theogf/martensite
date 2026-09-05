@@ -108,13 +108,20 @@
           (let ([t (trim out)]) (if (equal? t "") #f t))
           #f))))
 
-;; Zellij prints "Tab: <name>" as its first line; cut the label off.
+;; Zellij's first line is `name: <tab name>` — split on the first ": " rather
+;; than a fixed offset, so a format change degrades to a wrong-but-harmless name
+;; instead of a truncated one.
 (define (zellij-tab)
   (and (env-or-false "ZELLIJ")
        (let ([out (capture-or-false "zellij" (list "action" "current-tab-info"))])
          (and out
-              (let ([pair (split-once out ": ")])
-                (and pair (trim (list-ref pair 1))))))))
+              ;; current-tab-info prints several `key: value` lines (name, id,
+              ;; position, ...) — take the first line BEFORE splitting, or the
+              ;; name comes back with the rest of the report glued to it.
+              (let ([pair (split-once (car (split-many out "\n")) ": ")])
+                (and pair
+                     (let ([name (trim (list-ref pair 1))])
+                       (if (equal? name "") #f name))))))))
 
 (define (tmux-window)
   (and (env-or-false "TMUX")
@@ -125,6 +132,10 @@
 ;; falling back to a fixed default name is what makes both topologies line up.
 (define (resolve-session)
   (or (env-or-false "MARTENSITE_SESSION")
+      ;; jld's own override, honored so that one variable set in a Zellij/tmux
+      ;; layout names the session on both sides at once — the plugin reads it
+      ;; here, `jld connect` reads it from make_ctx.
+      (env-or-false "JLD_NAME")
       (first-line ".juliasession")
       (zellij-tab)
       (tmux-window)

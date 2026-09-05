@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>julia-steel — Conductor/Client Architecture</title>
+  <title>martensite — Architecture</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -228,45 +228,74 @@
 <div class="page">
 
   <header>
-    <h1>Conductor / Client Architecture</h1>
-    <p>How <code>juliaclient</code> and <code>julia-conductor</code> cooperate to route Julia REPL sessions.</p>
+    <h1>martensite Architecture</h1>
+    <p>How Helix, <code>jld</code>, and a live Julia REPL fit together.</p>
   </header>
 
-  <!-- ── Lifecycle diagram ── -->
+  <!-- ── Overview diagram ── -->
   <div class="diagram-wrap">
-    <div class="diagram-title">Lifecycle overview</div>
+    <div class="diagram-title">Two paths into one session</div>
 <pre class="diagram">
-juliaclient  ──[conductor.sock]──►  conductor  ──[wsetup.sock]──►  Julia worker
-                                                ◄──[control socket]──
-                     ◄──[4 socket paths]──
-juliaclient  ──[stdin / stdout / stderr / signals]────────────────► Julia worker
+                       paste path  (send-*)
+Helix ──► jld eval-repl ──[repl.sock]──► REPL tty buffer ──► your terminal
+                                          bracketed paste, ans set
+
+                       capture path  (eval-*)
+Helix ──► jld eval ─────[daemon.sock]──► eval in Main ────► Helix popup
+                                          prompt untouched
+
+Agents ─► jld --id=&lt;id&gt; eval ────────────► same Main, captured output
 </pre>
   </div>
+
+  <p style="color: var(--muted); margin-bottom: 2.5rem; font-size: .95rem;">
+    Both paths reach the same <code>Main</code>. They differ only in who evaluates
+    the code and therefore where the result comes out. There is no daemon of our
+    own in this picture: <code>jld</code> owns process lifetime, and martensite is
+    a single Steel file that shells out to it.
+  </p>
 
   <!-- ── Phase 1 ── -->
   <div class="phase phase-1">
     <div class="phase-header">
       <div class="phase-num">1</div>
-      <h2>Client connects to conductor</h2>
+      <h2>Resolving the session</h2>
     </div>
     <div class="phase-body">
-      <p style="margin-bottom:.75rem">Entry point: <code>juliaclient::main</code> — <code>client/src/main.rs:733</code></p>
-      <ol>
-        <li><strong>Scan env</strong> — compute an XOR fingerprint over all environment variables
-            (<code>scan_env</code>, line 34). Used as a cache key so the conductor avoids
-            requesting the full env on repeated calls from the same shell.</li>
-        <li><strong>Connect</strong> to the conductor's socket (Unix domain or TCP).
-            If the first attempt fails, signal the conductor via its PID file to recreate the
-            socket, then retry (<code>connect_to_conductor</code>, line 260).</li>
-        <li><strong>Send handshake</strong> (<code>send_client_info</code>, line 344):
-            magic <code>0x4A444301</code>, flags (tty?), pid, ppid, cwd, env fingerprint, argv.</li>
-        <li><strong>Conditional env dump</strong> — if the conductor responds with
-            <code>ENV_REQUEST</code> (<code>0x3F</code>), send the full env key/value list,
-            then continue reading (<code>receive_worker_sockets</code>, line 426).</li>
-        <li><strong>Receive 4 socket paths</strong> — stdin, stdout, stderr, signals —
-            returned as length-prefixed strings.</li>
-        <li>Connect to all four sockets directly on the Julia worker process.</li>
-      </ol>
+      <p style="margin-bottom:.75rem">Entry point: <code>resolve-session</code> — <code>martensite.scm</code></p>
+      <p style="margin-bottom:.75rem">
+        A daemon's identity is <em>project + name</em>. <code>jld</code> derives the
+        project itself by walking up from the subprocess working directory (inherited
+        from Helix) looking for a <code>Project.toml</code>, so the plugin only has to
+        supply the name — which exists to disambiguate several sessions on one project.
+      </p>
+      <ul class="priority-list">
+        <li>
+          <span class="priority-badge p1">1st</span>
+          <span><code>MARTENSITE_SESSION</code>, then <code>JLD_NAME</code> —
+          the latter is <code>jld</code>'s own override, honored here too so that one
+          variable set in a layout names the session on both sides at once.</span>
+        </li>
+        <li>
+          <span class="priority-badge p2">2nd</span>
+          <span>First line of a <code>.juliasession</code> file in the project root —
+          a name that survives renaming the tab.</span>
+        </li>
+        <li>
+          <span class="priority-badge p3">3rd</span>
+          <span>Zellij tab name, then tmux window name — probed by running
+          <code>zellij action current-tab-info</code> / <code>tmux display-message</code>,
+          gated on <code>ZELLIJ</code> / <code>TMUX</code> being set. Zellij reports
+          several <code>key: value</code> lines, so the first line is taken before
+          splitting on <code>": "</code>.</span>
+        </li>
+      </ul>
+      <p style="margin-top:.9rem">
+        Falling through all of those yields <code>repl</code>, which is what
+        <code>JuliaDaemon.serve()</code> picks with no arguments. Note that a
+        <em>spawned</em> daemon's default name is the empty string, a different id
+        entirely — so the name is always passed explicitly rather than omitted.
+      </p>
     </div>
   </div>
 
@@ -274,42 +303,30 @@ juliaclient  ──[stdin / stdout / stderr / signals]────────�
   <div class="phase phase-2">
     <div class="phase-header">
       <div class="phase-num">2</div>
-      <h2>Conductor dispatches the request</h2>
+      <h2>The paste path — <code>send-*</code></h2>
     </div>
     <div class="phase-body">
-      <p style="margin-bottom:.75rem">Entry point: <code>Conductor::handle_client</code> — <code>conductor/src/conductor.rs:250</code></p>
+      <p style="margin-bottom:.75rem">
+        <code>jld eval-repl</code> connects to <code>repl.sock</code>, served by the
+        REPL process itself (<code>JuliaDaemon/src/repl_input.jl</code>).
+      </p>
       <ol>
-        <li><strong>Read request</strong> — flags, pid, ppid, cwd, env fingerprint, raw argv.</li>
-        <li><strong>Resolve env</strong> — check <code>EnvCache</code> by fingerprint. On a miss,
-            send <code>ENV_REQUEST</code>, receive the full dump, cache it.</li>
-        <li><strong>Parse args</strong> and resolve the Julia project path.</li>
-        <li><strong>Compute worker key</strong> — a string that identifies which pool to draw from.
-            For a normal run: <code>project_path\0julia_channel</code>. Sandboxed variants use
-            a different prefix (<code>__sandbox__</code> / <code>__lsandbox__</code>).</li>
-        <li><strong>Select or spawn a worker</strong> using the priority logic below.</li>
-        <li>Call <code>worker.run_client(info)</code> — sends <code>ClientRun</code> over the
-            control socket and blocks waiting for a <code>Sockets</code> reply.</li>
-        <li><strong>Send the 4 socket paths</strong> back to the client.</li>
+        <li><strong>Stash</strong> any half-typed input out of the LineEdit buffer, so the
+            paste cannot splice into what the developer is mid-way through typing.</li>
+        <li><strong>Inject</strong> the code into <code>stdin</code>'s buffer wrapped in
+            bracketed-paste markers (<code>ESC[200~ … ESC[201~</code>), then notify the
+            tty condition variable.</li>
+        <li><strong>LineEdit cannot tell it from a real terminal paste</strong>: the code is
+            echoed at the prompt, evaluated by the REPL, <code>ans</code> is set, and the
+            prompt is redrawn.</li>
+        <li><strong>Restore</strong> the stashed input at the fresh prompt. Ordering is
+            guaranteed by byte order in the tty buffer.</li>
       </ol>
-
-      <p style="margin: 1rem 0 .4rem; font-weight: 600;">Worker selection priority</p>
-      <ul class="priority-list">
-        <li>
-          <span class="priority-badge p1">1st</span>
-          <span>Session label match — if <code>--session=label</code> was passed and a worker
-          carries that label, always route to it.</span>
-        </li>
-        <li>
-          <span class="priority-badge p2">2nd</span>
-          <span>PPID affinity — a worker that previously served the same parent shell PID is
-          preferred, so a terminal session keeps hitting the same Julia process.</span>
-        </li>
-        <li>
-          <span class="priority-badge p3">3rd</span>
-          <span>Second-most-recently-active available worker — the freshest available worker is
-          intentionally skipped to act as a warm standby.</span>
-        </li>
-      </ul>
+      <p style="margin-top:.9rem">
+        Because the REPL owns the evaluation, its output goes to the developer's
+        terminal. The socket acknowledges the paste and nothing more, so this path
+        cannot populate the popup.
+      </p>
     </div>
   </div>
 
@@ -317,25 +334,29 @@ juliaclient  ──[stdin / stdout / stderr / signals]────────�
   <div class="phase phase-3">
     <div class="phase-header">
       <div class="phase-num">3</div>
-      <h2>Worker spawning</h2>
+      <h2>The capture path — <code>eval-*</code></h2>
     </div>
     <div class="phase-body">
-      <p style="margin-bottom:.75rem">Entry point: <code>Worker::spawn_impl</code> — <code>conductor/src/worker.rs:112</code></p>
+      <p style="margin-bottom:.75rem">Entry point: <code>run-jld</code> — <code>martensite.scm</code></p>
       <ol>
-        <li>Create a temporary socket <code>wsetup.sock</code> in the runtime dir.</li>
-        <li>Launch Julia:
-            <code>julia --eval "using DaemonWorker; DaemonWorker.runworker(setup_path, id, conductor_path)"</code>.
-            The worker is placed in its own process group (<code>setpgid</code>) so terminal
-            SIGINT doesn't propagate to it.</li>
-        <li><strong>Block</strong> on <code>setup_listener.accept()</code>.
-            Julia's <code>DaemonWorker.runworker</code> connects back on startup, signalling
-            it is ready.</li>
-        <li>Delete the setup socket, send <code>WORKER_MAGIC</code> (<code>0x4A445701</code>),
-            and store the stream as the worker's long-lived <em>control socket</em>.</li>
-        <li>For sandboxed workers (Linux only) the same flow runs inside an unprivileged user
-            namespace created via raw <code>unshare</code>/<code>pivot_root</code>/<code>bind
-            mount</code> syscalls — no root required.</li>
+        <li><strong>Spawn</strong> <code>jld --name=&lt;session&gt; --max-output=16k eval &lt;code&gt;</code>
+            with both stdout and stderr piped. Piping stderr is not optional: Julia writes
+            errors and stacktraces there, and an unpiped stderr is inherited from Helix's own
+            process — it writes raw text straight to the terminal, bypassing the TUI
+            compositor and the popup entirely.</li>
+        <li><strong>Read both port handles before waiting.</strong>
+            <code>wait-&gt;stdout</code> consumes the whole child handle internally, leaving
+            nothing to pull stderr from afterwards.</li>
+        <li><strong>Unwrap the exit status.</strong> Steel's <code>wait</code> returns a
+            <code>Result</code>, not a bare integer — comparing it to <code>0</code> directly
+            is silently always false.</li>
       </ol>
+      <table class="io-table">
+        <tr><th>Exit</th><th>Meaning</th><th>Plugin response</th></tr>
+        <tr><td class="direction">0</td><td>evaluated</td><td>popup with the result</td></tr>
+        <tr><td class="direction">1</td><td>Julia error</td><td>popup with the stacktrace</td></tr>
+        <tr><td class="direction">3</td><td>daemon unreachable, or no REPL attached</td><td>fall back to a captured eval</td></tr>
+      </table>
     </div>
   </div>
 
@@ -343,15 +364,25 @@ juliaclient  ──[stdin / stdout / stderr / signals]────────�
   <div class="phase phase-4">
     <div class="phase-header">
       <div class="phase-num">4</div>
-      <h2>Worker accepts the client</h2>
+      <h2>Rendering the popup</h2>
     </div>
     <div class="phase-body">
-      <p>When the conductor sends <code>ClientRun</code>, <code>DaemonWorker.jl</code> creates
-      <strong>4 new sockets</strong> — one each for stdin, stdout, stderr, and signals — and
-      returns their paths (Unix socket paths, or <code>host:port</code> in TCP mode) in a
-      <code>Sockets</code> reply.</p>
-      <p style="margin-top:.75rem">The worker then blocks accepting connections on those four
-      sockets, waiting for the client to arrive. Once all four are connected, I/O can flow.</p>
+      <p style="margin-bottom:.75rem">Entry point: <code>show-output!</code> — <code>martensite.scm</code></p>
+      <ol>
+        <li>Captured text is fed to a real VTE (steel-pty's <code>raw-virtual-terminal</code>)
+            rather than being rendered as markdown, so the terminal emulator does its own
+            line-wrapping and would interpret SGR codes if any arrived.</li>
+        <li><strong>Newlines are rewritten to CRLF first.</strong> The output is piped, not a
+            pty, so there is no kernel tty driver to translate them; a faithful VTE treats a
+            bare <code>\n</code> as a linefeed only, and every line after the first would
+            staircase to the right.</li>
+        <li><strong>The VTE is 300 rows tall</strong>, far more than the popup shows. Sized to
+            the visible rows it would scroll like a real terminal as it is fed, showing the
+            <em>tail</em> of a long stacktrace and cutting off the <code>ERROR:</code> line at
+            the top — which is the useful part. The render step windows it back down.</li>
+        <li>The box is anchored below the cursor, clamped into the editor area, and dismissed
+            on the next key event.</li>
+      </ol>
     </div>
   </div>
 
@@ -359,131 +390,56 @@ juliaclient  ──[stdin / stdout / stderr / signals]────────�
   <div class="phase phase-5">
     <div class="phase-header">
       <div class="phase-num">5</div>
-      <h2>I/O proxying</h2>
+      <h2>Agents sharing the session</h2>
     </div>
     <div class="phase-body">
-      <p style="margin-bottom:.75rem">Entry point: <code>run_event_loop</code> — <code>client/src/main.rs:616</code></p>
-      <p style="margin-bottom:.75rem">A <code>poll()</code> loop over four file descriptors:</p>
-
-      <table class="io-table">
-        <thead>
-          <tr><th>FD</th><th>Direction</th><th>Notes</th></tr>
-        </thead>
-        <tbody>
-          <tr>
-            <td><code>stdin</code></td>
-            <td class="direction">→ worker stdin</td>
-            <td>Raw bytes forwarded. In <code>--sync</code> mode without raw terminal,
-                <code>CookedState</code> provides client-side line editing with local echo
-                before sending.</td>
-          </tr>
-          <tr>
-            <td><code>worker stdout</code></td>
-            <td class="direction">→ terminal stdout</td>
-            <td>Straight byte copy.</td>
-          </tr>
-          <tr>
-            <td><code>worker stderr</code></td>
-            <td class="direction">→ terminal stderr</td>
-            <td>Straight byte copy.</td>
-          </tr>
-          <tr>
-            <td><code>signals socket</code></td>
-            <td class="direction">bidirectional</td>
-            <td>Typed message channel — see signal table below. Loop exits when
-                <code>SIG_EXIT</code> is received <em>and</em> both stdout and stderr have
-                reached EOF.</td>
-          </tr>
-        </tbody>
-      </table>
-
-      <p style="margin: 1rem 0 .4rem; font-weight: 600;">Signal messages</p>
-      <table class="signal-table">
-        <thead>
-          <tr><th>ID</th><th>Name</th><th>Description</th></tr>
-        </thead>
-        <tbody>
-          <tr>
-            <td><code>0x01</code></td>
-            <td><code>SIG_EXIT</code></td>
-            <td>Worker sends exit code; client tears down and exits.</td>
-          </tr>
-          <tr>
-            <td><code>0x02</code></td>
-            <td><code>SIG_RAW_MODE</code></td>
-            <td>Worker requests raw / cooked terminal mode. Client acks with same ID.</td>
-          </tr>
-          <tr>
-            <td><code>0x03</code></td>
-            <td><code>SIG_QUERY_SIZE</code></td>
-            <td>Worker asks for terminal dimensions. Client replies with rows + cols.</td>
-          </tr>
-          <tr>
-            <td><code>0x04</code></td>
-            <td><code>SIG_NODELAY</code></td>
-            <td>Request TCP_NODELAY on the socket.</td>
-          </tr>
-        </tbody>
-      </table>
-
-      <p style="margin-top:1rem">
-        <strong>SIGINT forwarding</strong> — the client installs a custom
-        <code>SIGINT</code> handler that writes a raw <code>\x03</code> byte onto the worker's
-        stdin socket (line 587) instead of raising the signal locally. This lets Ctrl-C reach
-        Julia's REPL interrupt handler correctly even when the terminal is in raw mode.
+      <p style="margin-bottom:.75rem">
+        This is the property the whole design exists to protect: an agent reuses the
+        developer's warm session without disturbing their work.
       </p>
+      <table class="io-table">
+        <tr><th>Command</th><th>Effect on the developer</th></tr>
+        <tr><td class="direction">jld --id=&lt;id&gt; eval</td>
+            <td>None. Output is captured to the agent; the prompt is never touched.</td></tr>
+        <tr><td class="direction">--scratch</td>
+            <td>Evaluates in a throwaway module that <em>sees</em> <code>Main</code>'s bindings
+                but cannot clobber them.</td></tr>
+        <tr><td class="direction">--module=M</td>
+            <td>A persistent agent namespace beside <code>Main</code>.</td></tr>
+        <tr><td class="direction">--name=&lt;unique&gt;</td>
+            <td>A wholly separate daemon, when sharing is not wanted at all.</td></tr>
+        <tr><td class="direction">jld transcript</td>
+            <td>Reads what the developer has been doing, for context.</td></tr>
+      </table>
     </div>
   </div>
 
-  <!-- ── Phase 6 ── -->
-  <div class="phase phase-6">
-    <div class="phase-header">
-      <div class="phase-num">6</div>
-      <h2>Teardown</h2>
-    </div>
-    <div class="phase-body">
-      <ol>
-        <li>Restore terminal to cooked mode (<code>set_raw_mode(false)</code>).</li>
-        <li>Send a <code>ClientExit</code> notification to the conductor
-            (<code>notify_exit</code>, line 559): magic <code>0x4A444E01</code>, type
-            <code>0x04</code>, client pid.</li>
-        <li>The conductor's accept loop recognises the notification magic and routes it to
-            <code>handle_notification</code>, which decrements the worker's
-            <code>active_clients</code> count and optionally runs a health-check ping.</li>
-        <li>Exit with the code received from <code>SIG_EXIT</code>.</li>
-      </ol>
-    </div>
-  </div>
-
-  <!-- ── Background health checks ── -->
+  <!-- ── Known gaps ── -->
   <div class="phase phase-bg">
     <div class="phase-header">
-      <div class="phase-num">∞</div>
-      <h2>Background health checks</h2>
+      <div class="phase-num">!</div>
+      <h2>Known gaps</h2>
     </div>
     <div class="phase-body">
-      <p>A background thread calls <code>Conductor::check_workers</code> periodically.
-      For each idle worker whose last-ping timestamp is older than <code>ping_interval</code>:</p>
-      <ol style="margin-top:.75rem">
-        <li>Send <code>Ping</code> on the control socket; wait up to <code>ping_timeout</code>
-            for a <code>Pong</code>.</li>
-        <li>On timeout or error: kill the worker (<code>SIGKILL</code>) and remove it from the
-            pool.</li>
-        <li>On <code>Pong</code>: compare the worker's self-reported active-client count with
-            the conductor's count. If they diverge, send <code>SyncClients</code> with the
-            conductor's PID list so the worker can reconcile.</li>
-      </ol>
-      <p style="margin-top:.75rem">
-        The conductor also maintains a <em>reserve worker</em> — a pre-warmed Julia process
-        that is assigned to the first incoming client that doesn't need an interactive session,
-        eliminating Julia startup latency. Once consumed, a new reserve is spawned immediately.
+      <p style="margin-bottom:.75rem">
+        Both live upstream in JuliaDaemon.jl, and both are small.
       </p>
+      <ol>
+        <li><strong><code>eval-repl</code> never returns the result.</strong>
+            <code>cmd_eval_repl</code> reads back only a <code>done</code> frame, so the paste
+            path has nothing to show in a popup. Making the socket wait for the evaluation and
+            return its captured output would close this.</li>
+        <li><strong><code>jld eval</code> output is always monochrome.</strong> The wire
+            protocol already carries a <code>color</code> field, threaded all the way into the
+            result and error renderers — but only the attached-REPL client ever sets it, and
+            there is no CLI flag. The daemon side is built; only a client flag is missing.</li>
+      </ol>
     </div>
   </div>
 
   <footer>
-    Generated from <code>conductor/src/conductor.rs</code>, <code>conductor/src/worker.rs</code>,
-    and <code>client/src/main.rs</code>.
+    Generated from <code>martensite.scm</code> and JuliaDaemon.jl's
+    <code>src/repl_input.jl</code>, <code>src/client.jl</code>, and <code>src/daemon.jl</code>.
   </footer>
 
 </div>

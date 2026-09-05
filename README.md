@@ -30,28 +30,65 @@ julia -e 'using Pkg; Pkg.app add url="https://github.com/KristofferC/JuliaDaemon
 That installs `jld` into `~/.julia/bin`. Put it on your `PATH` (`jld install`
 will symlink it into `~/.local/bin` if it isn't already).
 
-### 3. A named Julia session
+### 3. A Julia session named from context
 
-Both sides have to agree on a session name — `repl` unless you override it (see
-[Session resolution](#session-resolution)). Either topology works:
+Both sides derive the session name from the same context, so they find each
+other without either being told. The plugin does its half itself; give your
+shell the matching half once, in your own config:
 
-**A — daemon owns `Main`, thin REPL attached** (survives closing the terminal):
-
-```sh
-jld connect --name=repl
+```fish
+# ~/.config/fish/config.fish
+function quench --description "Attach a jld REPL named after the current context"
+    set -l session
+    if set -q JLD_NAME
+        set session $JLD_NAME
+    else if test -f .juliasession
+        set session (head -1 .juliasession | string trim)
+    else if set -q ZELLIJ
+        set session (zellij action current-tab-info | head -1 | string replace -r '^[^:]*: ' '')
+    else if set -q TMUX
+        set session (tmux display-message -p '#W')
+    else
+        set session repl
+    end
+    jld connect --name=$session $argv
+end
 ```
 
-**B — your own `julia` serves itself** (dies with the terminal):
+<details>
+<summary>bash / zsh</summary>
+
+```bash
+quench() {
+    local session
+    if [[ -n "$JLD_NAME" ]]; then session="$JLD_NAME"
+    elif [[ -f .juliasession ]]; then session=$(head -1 .juliasession)
+    elif [[ -n "$ZELLIJ" ]]; then session=$(zellij action current-tab-info | head -1 | sed 's/^[^:]*: //')
+    elif [[ -n "$TMUX" ]]; then session=$(tmux display-message -p '#W')
+    else session=repl
+    fi
+    jld connect --name="$session" "$@"
+}
+```
+</details>
+
+Then `quench` is your Julia pane's command in your Zellij/Tmux layout, exactly
+as before. If you would rather not carry a shell function at all, set `JLD_NAME`
+per-pane in the layout instead: both the plugin and `jld` read it directly, and
+plain `jld connect` then lands on the right session with no wrapper.
+
+That form — `jld connect` — puts `Main` in a daemon that outlives the terminal,
+so closing and reattaching **resumes the previous session's state**. If you want
+a REPL whose state dies with its terminal, serve your own instead:
 
 ```julia
 using JuliaDaemon
-JuliaDaemon.serve(name="repl")
+JuliaDaemon.serve(name = "…")   # the same resolved name
 ```
 
-Set whichever you prefer as the command for your Julia pane in your Zellij/Tmux
-layout. Neither is required to be running before you send code: if no REPL is
-attached, sends fall back to a captured evaluation in the same daemon and the
-result is shown in the popup instead of the terminal.
+Neither has to be running before you send code. With no REPL attached, sends
+fall back to a captured evaluation in the same daemon and the result appears in
+the popup instead of the terminal.
 
 ## Installation
 
@@ -103,15 +140,17 @@ from Helix's working directory — so the session name only has to disambiguate
 several sessions on one project. The plugin resolves it as:
 
 1. **`MARTENSITE_SESSION`** environment variable, if set.
-2. **`.juliasession` file** — its first line, if the file exists in the project root.
-3. **Zellij tab name** — if Helix is running inside Zellij.
-4. **Tmux window name** — if Helix is running inside tmux.
-5. **`repl`** — the default, which is also what `JuliaDaemon.serve()` picks with
-   no arguments.
+2. **`JLD_NAME`** — `jld`'s own override, honored here too so that one variable
+   set in a Zellij/tmux layout names the session on both sides at once.
+3. **`.juliasession` file** — its first line, if the file exists in the project root.
+4. **Zellij tab name** — if Helix is running inside Zellij.
+5. **Tmux window name** — if Helix is running inside tmux.
+6. **`repl`** — the last-resort default, which is also what `JuliaDaemon.serve()`
+   picks with no arguments.
 
-Whatever it resolves to must match the `--name=` you gave `jld connect`, or the
-`name=` you gave `JuliaDaemon.serve`. Name your Zellij tabs or tmux windows
-meaningfully and both sides find each other automatically.
+Name your Zellij tabs or tmux windows meaningfully and both sides find each
+other automatically. Use `.juliasession` to pin a name that survives renaming
+the tab.
 
 ## Agents
 
